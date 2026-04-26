@@ -1,0 +1,23 @@
+.DS_Store
+node_modules/
+codex-images/
+tmp/
+*.log
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# Local env files
+.env
+.env.local
+.env.*.local
+
+# AI assistant context (kept local; not shared via git)
+CLAUDE.md
+AGENTS.md
+.claude/

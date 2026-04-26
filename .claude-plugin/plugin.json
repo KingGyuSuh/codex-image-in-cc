@@ -1,0 +1,13 @@
+{
+  "name": "codex-image",
+  "version": "0.1.0",
+  "description": "Generate and edit images from Claude Code by dispatching to Codex CLI's built-in imagegen skill.",
+  "author": {
+    "name": "KingGyuSuh",
+    "url": "https://github.com/KingGyuSuh"
+  },
+  "homepage": "https://github.com/KingGyuSuh/codex-image-in-cc",
+  "repository": "https://github.com/KingGyuSuh/codex-image-in-cc",
+  "license": "Apache-2.0",
+  "keywords": ["codex", "image-generation", "imagegen", "claude-code", "claude-code-plugin"]
+}
