@@ -10,6 +10,25 @@ import { pathToFileURL } from "node:url";
 const MIN_NODE_VERSION = "18.18.0";
 const MIN_CODEX_VERSION = "0.124.0";
 
+function resolveCodex() {
+  if (process.platform !== "win32") {
+    return { command: "codex", prefix: [] };
+  }
+  const whereResult = spawnSync("where.exe", ["codex.cmd"], {
+    encoding: "utf8",
+    windowsHide: true
+  });
+  const cmdPath = String(whereResult.stdout || "").split(/\r?\n/).map((s) => s.trim()).find(Boolean);
+  if (cmdPath) {
+    const jsPath = path.join(path.dirname(cmdPath), "node_modules", "@openai", "codex", "bin", "codex.js");
+    if (fs.existsSync(jsPath)) {
+      return { command: process.execPath, prefix: [jsPath] };
+    }
+  }
+  return { command: "codex.cmd", prefix: [] };
+}
+const CODEX = resolveCodex();
+
 function parseSemver(text) {
   const match = String(text ?? "").match(/(\d+)\.(\d+)\.(\d+)/);
   if (!match) {
@@ -106,16 +125,16 @@ function buildStatusReport(options = {}) {
   const nodeVersionCompare = compareSemver(nodeVersion, MIN_NODE_VERSION);
   const nodeOk = nodeVersionCompare !== null && nodeVersionCompare >= 0;
 
-  const codexVersion = runSync("codex", ["--version"], { cwd });
+  const codexVersion = runSync(CODEX.command, [...CODEX.prefix, "--version"], { cwd });
   const codexVersionText = (codexVersion.stdout || codexVersion.stderr).trim();
   const codexVersionCompare = compareSemver(codexVersionText, MIN_CODEX_VERSION);
   const codexOk = codexVersion.available && codexVersion.status === 0 && codexVersionCompare !== null && codexVersionCompare >= 0;
 
-  const loginStatus = codexOk ? runSync("codex", ["login", "status"], { cwd }) : null;
+  const loginStatus = codexOk ? runSync(CODEX.command, [...CODEX.prefix, "login", "status"], { cwd }) : null;
   const loginText = loginStatus ? (loginStatus.stdout || loginStatus.stderr).trim() : "Codex unavailable";
   const loginOk = Boolean(loginStatus?.status === 0 && /logged in/i.test(loginText));
 
-  const fullAutoStatus = codexOk ? runSync("codex", ["exec", "--full-auto", "--help"], { cwd }) : null;
+  const fullAutoStatus = codexOk ? runSync(CODEX.command, [...CODEX.prefix, "exec", "--full-auto", "--help"], { cwd }) : null;
   const fullAutoOk = Boolean(fullAutoStatus?.status === 0);
 
   const imagegenSkillPath = findImagegenSkill();
@@ -230,7 +249,7 @@ User edit request:
 
 function spawnCodex(args, cwd) {
   return new Promise((resolve, reject) => {
-    const child = spawn("codex", args, {
+    const child = spawn(CODEX.command, [...CODEX.prefix, ...args], {
       cwd,
       env: process.env,
       stdio: ["ignore", "inherit", "inherit"],
