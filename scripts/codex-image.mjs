@@ -204,7 +204,45 @@ function splitFirstToken(raw) {
   return { input: null, prompt: null };
 }
 
+function parseGenerateArgs(argv) {
+  const images = [];
+  const promptParts = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--image" || token === "-i") {
+      const value = argv[index + 1];
+      if (value !== undefined && value !== null && String(value).length > 0) {
+        images.push(String(value));
+        index += 1;
+      }
+      continue;
+    }
+    if (typeof token === "string" && token.startsWith("--image=")) {
+      const value = token.slice("--image=".length);
+      if (value.length > 0) {
+        images.push(value);
+      }
+      continue;
+    }
+    promptParts.push(token);
+  }
+  return { images, prompt: promptParts.join(" ").trim() };
+}
+
 const GENERATE_INSTRUCTION_PREFIX = `Use the imagegen skill. Built-in image_gen tool path only — do not use the CLI fallback (no OPENAI_API_KEY required).
+
+If the user did not specify an output path, save under ./codex-images/<UTC-timestamp>-<n>.png (n=1,2,... per image).
+
+For each saved image, print exactly one line:
+SAVED: <absolute path>
+
+User request:
+
+`;
+
+const GENERATE_WITH_REFS_INSTRUCTION_PREFIX = `Use the imagegen skill. Built-in image_gen tool path only — do not use the CLI fallback (no OPENAI_API_KEY required).
+
+The image(s) attached via --image are STYLE / COMPOSITION / SUBJECT references, NOT edit targets. Do not preserve or modify them; use them only to guide style, composition, mood, or subject appearance for the newly generated images.
 
 If the user did not specify an output path, save under ./codex-images/<UTC-timestamp>-<n>.png (n=1,2,... per image).
 
@@ -244,21 +282,35 @@ function spawnCodex(args, cwd) {
 }
 
 async function handleGenerate(argv) {
-  const prompt = (argv.join(" ") || "").trim();
+  const { images, prompt } = parseGenerateArgs(argv);
   if (!prompt) {
-    console.error("Usage: /codex-image:generate <natural-language image request>");
+    console.error("Usage: /codex-image:generate [--image <path>]... <natural-language image request>");
     process.exitCode = 1;
     return;
   }
   const cwd = process.cwd();
+  const resolvedImages = [];
+  for (const img of images) {
+    const abs = path.resolve(cwd, img);
+    if (!fs.existsSync(abs)) {
+      console.error(`Reference image not found: ${abs}`);
+      process.exitCode = 1;
+      return;
+    }
+    resolvedImages.push(abs);
+  }
+  const instructionPrefix = resolvedImages.length > 0
+    ? GENERATE_WITH_REFS_INSTRUCTION_PREFIX
+    : GENERATE_INSTRUCTION_PREFIX;
   const codexArgs = [
     "exec",
     "--full-auto",
     "--skip-git-repo-check",
+    ...resolvedImages.flatMap((img) => ["--image", img]),
     "-C",
     cwd,
     "--",
-    GENERATE_INSTRUCTION_PREFIX + prompt
+    instructionPrefix + prompt
   ];
   const result = await spawnCodex(codexArgs, cwd);
   if (result.status !== 0) {
@@ -321,12 +373,12 @@ function usage() {
     "",
     "Commands:",
     "  status [--json] [--cwd <dir>]                Report Codex CLI prerequisites and login state",
-    "  generate <natural-language image request>    Dispatch a generate request to Codex's imagegen skill",
+    "  generate [--image <path>]... <request>       Dispatch a generate request; --image is repeatable for style/subject references",
     "  edit <input-path> <edit instructions>        Dispatch an edit request to Codex's imagegen skill (codex exec --image)",
     "",
     "Each command is also exposed as a Claude Code plugin skill:",
     "  /codex-image:status",
-    "  /codex-image:generate <...>",
+    "  /codex-image:generate [--image <path>]... <...>",
     "  /codex-image:edit <input-path> <...>"
   ].join("\n");
 }
