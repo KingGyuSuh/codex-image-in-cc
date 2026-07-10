@@ -181,6 +181,10 @@ For generate, `--image` is an attachment mechanism, not a request to edit those 
 
 The conditioning mechanism changed in Codex CLI 0.144.0: image generation moved to an extension-backed tool (`image_gen.imagegen`) whose image inputs are local absolute paths the Codex-side model passes itself (`referenced_image_paths`, max 5, also used for edit targets). Attached turn images are no longer implicitly fed to the image tool. The wrapper therefore lists each reference's (and the edit target's) absolute path in the instruction text so the model can pass them to the tool, while keeping the `codex exec --image` attachments so the model can see the pixels for prompt-writing and validation — and so the 0.142–0.143 built-in tool path keeps working. The wrapper itself never calls the image tool and never passes `referenced_image_paths`; the Codex-side `imagegen` skill owns that decision.
 
+### Windows codex spawning
+
+On Windows, npm installs `codex` as a `codex.cmd` shim. `spawn("codex", ...)` does not find it (`ENOENT`), and Node 20+ refuses to spawn `.cmd` files directly without `shell: true` (`EINVAL`, post-[CVE-2024-27980](https://nodejs.org/en/blog/vulnerability/april-2024-security-releases-2) hardening). `shell: true` is not an acceptable fix because user prompts contain quotes, ampersands, and non-ASCII text that cmd.exe would re-parse. The wrapper instead resolves the shim via `where.exe codex.cmd`, locates the real entry point at `<shim-dir>/node_modules/@openai/codex/bin/codex.js`, and spawns it with `process.execPath` (node.exe). If resolution fails it falls back to `codex.cmd`. macOS/Linux behavior is unchanged.
+
 ### Token accounting
 
 Agent tokens count against the user's Codex usage limits; a typical single-image `quality=low` turn is around 30k agent tokens on top of the image-generation cost itself. Do not hide this from users.

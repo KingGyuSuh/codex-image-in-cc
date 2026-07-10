@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/codex-image:status` now checks `codex exec --image` attachment support.
 - Docs: staging filenames under `~/.codex/generated_images/` are documented as version-dependent (`ig_<hash>.png` pre-0.144, `<call-id>.png` on the 0.144+ extension); only the `SAVED:` stdout contract is load-bearing.
 
+### Fixed
+
+- Windows: `codex` is now spawned via `node.exe` and the resolved `codex.js` entry point, fixing `spawnSync codex ENOENT` / `codex.cmd EINVAL` (Node 20+ `.cmd` hardening) without falling back to `shell: true`. Supersedes [#2](https://github.com/KingGyuSuh/codex-image-in-cc/pull/2) — thanks @pingguoge001-coder for the diagnosis, fix, and Windows 11 validation.
+
 ## [0.1.0] - 2026-04-26
 
 ### Added

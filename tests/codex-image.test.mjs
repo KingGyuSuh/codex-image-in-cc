@@ -6,6 +6,7 @@ import {
   buildGenerateInstruction,
   compareSemver,
   parseGenerateArguments,
+  resolveCodex,
   splitFirstToken,
   timestampForFile
 } from "../scripts/codex-image.mjs";
@@ -112,4 +113,8 @@ test("buildEditInstruction names the edit target's absolute path", () => {
   assert.match(instruction, /referenced_image_paths/);
   assert.match(instruction, /SAVED: <absolute path>/);
   assert.match(instruction, /tint it blue/);
+});
+
+test("resolveCodex uses the bare codex command outside Windows", { skip: process.platform === "win32" }, () => {
+  assert.deepEqual(resolveCodex(), { command: "codex", prefix: [] });
 });

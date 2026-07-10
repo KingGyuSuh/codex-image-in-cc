@@ -13,6 +13,33 @@ const MIN_CODEX_VERSION = "0.142.0";
 // request (schema-enforced via `referenced_image_paths` since codex 0.144).
 const MAX_REFERENCE_IMAGES = 5;
 
+// On Windows, `spawn("codex", ...)` misses the npm `codex.cmd` shim (ENOENT) and
+// Node 20+ refuses to spawn `.cmd` directly without a shell (EINVAL, post
+// CVE-2024-27980 hardening). Shelling out would re-expose user prompts to cmd.exe
+// parsing, so resolve the shim to its codex.js entry and run it with node.exe.
+function resolveCodex() {
+  if (process.platform !== "win32") {
+    return { command: "codex", prefix: [] };
+  }
+  const whereResult = spawnSync("where.exe", ["codex.cmd"], {
+    encoding: "utf8",
+    windowsHide: true
+  });
+  const cmdPath = String(whereResult.stdout || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  if (cmdPath) {
+    const jsPath = path.join(path.dirname(cmdPath), "node_modules", "@openai", "codex", "bin", "codex.js");
+    if (fs.existsSync(jsPath)) {
+      return { command: process.execPath, prefix: [jsPath] };
+    }
+  }
+  return { command: "codex.cmd", prefix: [] };
+}
+
+const CODEX = resolveCodex();
+
 function parseSemver(text) {
   const match = String(text ?? "").match(/(\d+)\.(\d+)\.(\d+)/);
   if (!match) {
@@ -109,16 +136,16 @@ function buildStatusReport(options = {}) {
   const nodeVersionCompare = compareSemver(nodeVersion, MIN_NODE_VERSION);
   const nodeOk = nodeVersionCompare !== null && nodeVersionCompare >= 0;
 
-  const codexVersion = runSync("codex", ["--version"], { cwd });
+  const codexVersion = runSync(CODEX.command, [...CODEX.prefix, "--version"], { cwd });
   const codexVersionText = (codexVersion.stdout || codexVersion.stderr).trim();
   const codexVersionCompare = compareSemver(codexVersionText, MIN_CODEX_VERSION);
   const codexOk = codexVersion.available && codexVersion.status === 0 && codexVersionCompare !== null && codexVersionCompare >= 0;
 
-  const loginStatus = codexOk ? runSync("codex", ["login", "status"], { cwd }) : null;
+  const loginStatus = codexOk ? runSync(CODEX.command, [...CODEX.prefix, "login", "status"], { cwd }) : null;
   const loginText = loginStatus ? (loginStatus.stdout || loginStatus.stderr).trim() : "Codex unavailable";
   const loginOk = Boolean(loginStatus?.status === 0 && /logged in/i.test(loginText));
 
-  const fullAutoStatus = codexOk ? runSync("codex", ["exec", "--full-auto", "--help"], { cwd }) : null;
+  const fullAutoStatus = codexOk ? runSync(CODEX.command, [...CODEX.prefix, "exec", "--full-auto", "--help"], { cwd }) : null;
   const fullAutoOk = Boolean(fullAutoStatus?.status === 0);
   const execHelpText = `${fullAutoStatus?.stdout ?? ""}\n${fullAutoStatus?.stderr ?? ""}`;
   const imageAttachmentOk = Boolean(fullAutoOk && /(^|\s)(-i,\s*)?--image(\s|=|<|$)/.test(execHelpText));
@@ -323,7 +350,7 @@ ${prompt}`;
 
 function spawnCodex(args, cwd) {
   return new Promise((resolve, reject) => {
-    const child = spawn("codex", args, {
+    const child = spawn(CODEX.command, [...CODEX.prefix, ...args], {
       cwd,
       env: process.env,
       stdio: ["ignore", "inherit", "inherit"],
@@ -481,6 +508,7 @@ export {
   buildEditInstruction,
   buildGenerateInstruction,
   buildStatusReport,
+  resolveCodex,
   compareSemver,
   parseSemver,
   parseGenerateArguments,
