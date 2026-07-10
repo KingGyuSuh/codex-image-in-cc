@@ -1,10 +1,12 @@
 ---
-description: Generate one or more images through Codex CLI's built-in imagegen skill
-argument-hint: '<natural-language image request>'
+description: Generate one or more images, optionally with reference images, through Codex CLI's built-in imagegen skill
+argument-hint: '[--ref <reference-image> ...] <natural-language image request>'
 allowed-tools: Bash(node:*)
 ---
 
 # Generate Codex Image
+
+Leading `--ref <path>`, `--reference <path>`, or `--image <path>` arguments are reference images for generation, not edit targets. Repeat the flag for multiple references (max 5); quote paths with spaces.
 
 Run:
 

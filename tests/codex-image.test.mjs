@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { compareSemver, splitFirstToken, timestampForFile } from "../scripts/codex-image.mjs";
+import {
+  buildEditInstruction,
+  buildGenerateInstruction,
+  compareSemver,
+  parseGenerateArguments,
+  splitFirstToken,
+  timestampForFile
+} from "../scripts/codex-image.mjs";
 
 test("compareSemver handles prefixed command output", () => {
   assert.equal(compareSemver("codex-cli 0.124.0", "0.124.0"), 0);
@@ -44,4 +51,65 @@ test("splitFirstToken returns input only when prompt is missing", () => {
     input: "only-path.png",
     prompt: ""
   });
+});
+
+test("parseGenerateArguments returns prompt with no references", () => {
+  assert.deepEqual(parseGenerateArguments("draw a red kite"), {
+    referenceImages: [],
+    prompt: "draw a red kite"
+  });
+});
+
+test("parseGenerateArguments supports repeated reference flags", () => {
+  assert.deepEqual(parseGenerateArguments('--ref style.png --reference "subject photo.png" draw a poster'), {
+    referenceImages: ["style.png", "subject photo.png"],
+    prompt: "draw a poster"
+  });
+});
+
+test("parseGenerateArguments supports --image alias and equals form", () => {
+  assert.deepEqual(parseGenerateArguments("--image=style.png --ref pose.png draw a scene"), {
+    referenceImages: ["style.png", "pose.png"],
+    prompt: "draw a scene"
+  });
+});
+
+test("parseGenerateArguments supports delimiter before flag-like prompt text", () => {
+  assert.deepEqual(parseGenerateArguments("-- --ref should appear as literal prompt text"), {
+    referenceImages: [],
+    prompt: "--ref should appear as literal prompt text"
+  });
+});
+
+test("parseGenerateArguments rejects missing reference path", () => {
+  assert.throws(() => parseGenerateArguments("--ref"), /Missing value for --ref/);
+  assert.throws(() => parseGenerateArguments("--reference --ref style.png draw"), /Missing value for --reference/);
+});
+
+test("parseGenerateArguments rejects more than five reference images", () => {
+  const flags = Array.from({ length: 6 }, (_, index) => `--ref r${index}.png`).join(" ");
+  assert.throws(() => parseGenerateArguments(`${flags} draw a poster`), /at most 5/);
+});
+
+test("buildGenerateInstruction lists absolute reference paths for the codex turn", () => {
+  const instruction = buildGenerateInstruction("draw a poster", ["/abs/style.png", "/abs/subject photo.png"]);
+  assert.match(instruction, /1\. \/abs\/style\.png/);
+  assert.match(instruction, /2\. \/abs\/subject photo\.png/);
+  assert.match(instruction, /referenced_image_paths/);
+  assert.match(instruction, /SAVED: <absolute path>/);
+  assert.match(instruction, /draw a poster/);
+});
+
+test("buildGenerateInstruction omits the reference block without references", () => {
+  const instruction = buildGenerateInstruction("draw a poster", []);
+  assert.doesNotMatch(instruction, /Reference images for generation/);
+  assert.match(instruction, /draw a poster/);
+});
+
+test("buildEditInstruction names the edit target's absolute path", () => {
+  const instruction = buildEditInstruction("/abs/my photo.png", "tint it blue");
+  assert.match(instruction, /\/abs\/my photo\.png/);
+  assert.match(instruction, /referenced_image_paths/);
+  assert.match(instruction, /SAVED: <absolute path>/);
+  assert.match(instruction, /tint it blue/);
 });

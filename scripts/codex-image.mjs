@@ -8,7 +8,10 @@ import process from "node:process";
 import { pathToFileURL } from "node:url";
 
 const MIN_NODE_VERSION = "18.18.0";
-const MIN_CODEX_VERSION = "0.124.0";
+const MIN_CODEX_VERSION = "0.142.0";
+// Contract cap of the Codex built-in image tool: at most 5 reference images per
+// request (schema-enforced via `referenced_image_paths` since codex 0.144).
+const MAX_REFERENCE_IMAGES = 5;
 
 function parseSemver(text) {
   const match = String(text ?? "").match(/(\d+)\.(\d+)\.(\d+)/);
@@ -117,11 +120,13 @@ function buildStatusReport(options = {}) {
 
   const fullAutoStatus = codexOk ? runSync("codex", ["exec", "--full-auto", "--help"], { cwd }) : null;
   const fullAutoOk = Boolean(fullAutoStatus?.status === 0);
+  const execHelpText = `${fullAutoStatus?.stdout ?? ""}\n${fullAutoStatus?.stderr ?? ""}`;
+  const imageAttachmentOk = Boolean(fullAutoOk && /(^|\s)(-i,\s*)?--image(\s|=|<|$)/.test(execHelpText));
 
   const imagegenSkillPath = findImagegenSkill();
   const imagegenOk = Boolean(imagegenSkillPath);
 
-  const ready = nodeOk && codexOk && loginOk && fullAutoOk && imagegenOk;
+  const ready = nodeOk && codexOk && loginOk && fullAutoOk && imageAttachmentOk && imagegenOk;
   const nextSteps = [];
   if (!nodeOk) {
     nextSteps.push(`Install Node.js ${MIN_NODE_VERSION} or newer.`);
@@ -136,6 +141,9 @@ function buildStatusReport(options = {}) {
   }
   if (codexOk && !fullAutoOk) {
     nextSteps.push("This plugin depends on `codex exec --full-auto`; verify the installed Codex CLI still supports that documented alias.");
+  }
+  if (codexOk && fullAutoOk && !imageAttachmentOk) {
+    nextSteps.push("This plugin depends on `codex exec --image` for edit and reference-image input. Upgrade Codex CLI.");
   }
   if (!imagegenOk) {
     nextSteps.push("The Codex imagegen skill was not found under CODEX_HOME. Reinstall or update Codex CLI.");
@@ -158,6 +166,12 @@ function buildStatusReport(options = {}) {
         ? "`codex exec --full-auto` accepted"
         : (fullAutoStatus?.stderr || fullAutoStatus?.stdout || "not checked").trim()
     },
+    imageAttachment: {
+      ok: imageAttachmentOk,
+      detail: imageAttachmentOk
+        ? "`codex exec --image` accepted"
+        : "not found in `codex exec --help`"
+    },
     imagegenSkill: { ok: imagegenOk, path: imagegenSkillPath },
     nextSteps
   };
@@ -169,10 +183,12 @@ function renderStatusReport(report) {
   lines.push(statusLine(report.codex.ok, "Codex", `${report.codex.version} (minimum ${report.codex.minimum})`));
   lines.push(statusLine(report.login.ok, "Codex login", report.login.detail));
   lines.push(statusLine(report.fullAuto.ok, "Headless exec", report.fullAuto.detail));
+  lines.push(statusLine(report.imageAttachment.ok, "Image attachment", report.imageAttachment.detail));
   lines.push(statusLine(report.imagegenSkill.ok, "imagegen skill", report.imagegenSkill.path ?? "not found"));
   lines.push("");
   lines.push("Usage:");
   lines.push('  /codex-image:generate "A watercolor moonlit library, save to images/library.png at 1024x1024"');
+  lines.push('  /codex-image:generate --ref style.png --ref subject.png "A poster using those references, save to images/poster.png"');
   lines.push('  /codex-image:edit input.png "Replace the background with a clean white studio backdrop"');
   lines.push("");
   lines.push("Cost note: image generation runs a Codex agent turn and uses the Codex built-in image generation tool.");
@@ -204,20 +220,96 @@ function splitFirstToken(raw) {
   return { input: null, prompt: null };
 }
 
+const REFERENCE_IMAGE_FLAGS = new Set(["--ref", "--reference", "--image"]);
+
+function parseGenerateArguments(raw) {
+  let rest = String(raw ?? "").trim();
+  const referenceImages = [];
+
+  while (rest) {
+    const first = splitFirstToken(rest);
+    const token = first.input;
+    if (!token) {
+      break;
+    }
+
+    if (token === "--") {
+      rest = first.prompt ?? "";
+      break;
+    }
+
+    if (REFERENCE_IMAGE_FLAGS.has(token)) {
+      const next = splitFirstToken(first.prompt ?? "");
+      if (!next.input || next.input.startsWith("--")) {
+        throw new Error(`Missing value for ${token}.`);
+      }
+      referenceImages.push(next.input);
+      rest = next.prompt ?? "";
+      continue;
+    }
+
+    const equalsMatch = token.match(/^(--ref|--reference|--image)=(.+)$/);
+    if (equalsMatch) {
+      referenceImages.push(equalsMatch[2]);
+      rest = first.prompt ?? "";
+      continue;
+    }
+
+    break;
+  }
+
+  if (referenceImages.length > MAX_REFERENCE_IMAGES) {
+    throw new Error(
+      `Too many reference images (${referenceImages.length}). The built-in image generation tool accepts at most ${MAX_REFERENCE_IMAGES} per request — pass the ${MAX_REFERENCE_IMAGES} most relevant.`
+    );
+  }
+
+  return {
+    referenceImages,
+    prompt: rest.trim()
+  };
+}
+
+function resolveExistingImagePaths(inputs, cwd, label) {
+  return inputs.map((input) => {
+    const resolved = path.resolve(cwd, input);
+    if (!fs.existsSync(resolved)) {
+      throw new Error(`${label} image not found: ${resolved}`);
+    }
+    return resolved;
+  });
+}
+
+function formatReferenceImages(referenceImagePaths) {
+  if (referenceImagePaths.length === 0) {
+    return "";
+  }
+  const lines = referenceImagePaths.map((imagePath, index) => `${index + 1}. ${imagePath}`);
+  return `\nReference images for generation (also attached to this turn via codex exec --image):\n${lines.join("\n")}\n\nThese are generation references, not edit targets. If your built-in image generation tool accepts local image paths (codex 0.144+, referenced_image_paths), pass the absolute paths above so the reference pixels condition the output directly; otherwise use the attachments as visual context for style, identity, composition, mood, or subject guidance according to the user's prompt. Do not modify or overwrite the referenced files.\n`;
+}
+
 const GENERATE_INSTRUCTION_PREFIX = `Use the imagegen skill. Built-in image_gen tool path only — do not use the CLI fallback (no OPENAI_API_KEY required).
 
 If the user did not specify an output path, save under ./codex-images/<UTC-timestamp>-<n>.png (n=1,2,... per image).
 
 For each saved image, print exactly one line:
 SAVED: <absolute path>
-
-User request:
-
 `;
 
-const EDIT_INSTRUCTION_PREFIX = `Use the imagegen skill. Built-in image_gen tool path only — do not use the CLI fallback (no OPENAI_API_KEY required).
+function buildGenerateInstruction(prompt, referenceImagePaths) {
+  return `${GENERATE_INSTRUCTION_PREFIX}${formatReferenceImages(referenceImagePaths)}
+User request:
 
-The image attached via --image is the edit target. Preserve unrelated parts unless the user request says otherwise.
+${prompt}`;
+}
+
+function buildEditInstruction(inputPath, prompt) {
+  return `Use the imagegen skill. Built-in image_gen tool path only — do not use the CLI fallback (no OPENAI_API_KEY required).
+
+The edit target image (also attached to this turn via codex exec --image):
+${inputPath}
+
+If your built-in image generation tool accepts local image paths (codex 0.144+, referenced_image_paths), pass the absolute path above as the edit reference. Preserve unrelated parts unless the user request says otherwise.
 
 If the user did not specify an output path, save under ./codex-images/<UTC-timestamp>-edit-<n>.png (n=1,2,... per image).
 
@@ -226,7 +318,8 @@ SAVED: <absolute path>
 
 User edit request:
 
-`;
+${prompt}`;
+}
 
 function spawnCodex(args, cwd) {
   return new Promise((resolve, reject) => {
@@ -244,22 +337,39 @@ function spawnCodex(args, cwd) {
 }
 
 async function handleGenerate(argv) {
-  const prompt = (argv.join(" ") || "").trim();
+  const raw = (argv.join(" ") || "").trim();
+  let parsed;
+  try {
+    parsed = parseGenerateArguments(raw);
+  } catch (error) {
+    console.error(`Error: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  const { prompt, referenceImages } = parsed;
   if (!prompt) {
-    console.error("Usage: /codex-image:generate <natural-language image request>");
+    console.error("Usage: /codex-image:generate [--ref <reference-image> ...] <natural-language image request>");
     process.exitCode = 1;
     return;
   }
   const cwd = process.cwd();
+  let referenceImagePaths;
+  try {
+    referenceImagePaths = resolveExistingImagePaths(referenceImages, cwd, "Reference");
+  } catch (error) {
+    console.error(`Error: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
   const codexArgs = [
     "exec",
     "--full-auto",
     "--skip-git-repo-check",
-    "-C",
-    cwd,
-    "--",
-    GENERATE_INSTRUCTION_PREFIX + prompt
   ];
+  for (const imagePath of referenceImagePaths) {
+    codexArgs.push("--image", imagePath);
+  }
+  codexArgs.push("-C", cwd, "--", buildGenerateInstruction(prompt, referenceImagePaths));
   const result = await spawnCodex(codexArgs, cwd);
   if (result.status !== 0) {
     process.exitCode = result.status;
@@ -275,9 +385,11 @@ async function handleEdit(argv) {
     return;
   }
   const cwd = process.cwd();
-  const inputPath = path.resolve(cwd, input);
-  if (!fs.existsSync(inputPath)) {
-    console.error(`Input image not found: ${inputPath}`);
+  let inputPath;
+  try {
+    inputPath = resolveExistingImagePaths([input], cwd, "Input")[0];
+  } catch (error) {
+    console.error(`Error: ${error.message}`);
     process.exitCode = 1;
     return;
   }
@@ -290,7 +402,7 @@ async function handleEdit(argv) {
     "-C",
     cwd,
     "--",
-    EDIT_INSTRUCTION_PREFIX + prompt
+    buildEditInstruction(inputPath, prompt)
   ];
   const result = await spawnCodex(codexArgs, cwd);
   if (result.status !== 0) {
@@ -320,8 +432,8 @@ function usage() {
     "Usage: node scripts/codex-image.mjs <command> [args]",
     "",
     "Commands:",
-    "  status [--json] [--cwd <dir>]                Report Codex CLI prerequisites and login state",
-    "  generate <natural-language image request>    Dispatch a generate request to Codex's imagegen skill",
+    "  status [--json] [--cwd <dir>]                Report Codex CLI prerequisites and image support",
+    "  generate [--ref <path> ...] <request>         Dispatch a generate request to Codex's imagegen skill",
     "  edit <input-path> <edit instructions>        Dispatch an edit request to Codex's imagegen skill (codex exec --image)",
     "",
     "Each command is also exposed as a Claude Code plugin skill:",
@@ -366,9 +478,12 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
 }
 
 export {
+  buildEditInstruction,
+  buildGenerateInstruction,
   buildStatusReport,
   compareSemver,
   parseSemver,
+  parseGenerateArguments,
   renderStatusReport,
   splitFirstToken,
   timestampForFile

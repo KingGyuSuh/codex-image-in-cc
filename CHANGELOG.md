@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-10
+
+### Added
+
+- `/codex-image:generate` now accepts leading `--ref <path>`, `--reference <path>`, or `--image <path>` arguments and attaches them to the Codex turn as generation reference images (max 5, matching the built-in image tool's reference cap). Supersedes [#3](https://github.com/KingGyuSuh/codex-image-in-cc/pull/3) — thanks @pingguoge001-coder for the initial PR.
+- `/codex-image:edit` now also names the edit target's absolute path inside the instruction text.
+
+### Changed
+
+- Instruction prefixes updated for the Codex CLI 0.144 image-generation extension (`image_gen.imagegen`): reference and edit-target absolute paths are listed in the instruction so the Codex-side model can pass them via `referenced_image_paths`; `codex exec --image` attachments are kept for model visibility and 0.142–0.143 compatibility.
+- Minimum Codex CLI version is now v0.142.0 for current `imagegen` reference-image support; v0.144+ is recommended.
+- `/codex-image:status` now checks `codex exec --image` attachment support.
+- Docs: staging filenames under `~/.codex/generated_images/` are documented as version-dependent (`ig_<hash>.png` pre-0.144, `<call-id>.png` on the 0.144+ extension); only the `SAVED:` stdout contract is load-bearing.
+
 ## [0.1.0] - 2026-04-26
 
 ### Added

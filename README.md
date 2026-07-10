@@ -6,12 +6,12 @@
 
 Claude Code plugin that exposes Codex CLI's built-in `imagegen` skill as `/codex-image:*` user-invoked plugin skills.
 
-The plugin does not implement image generation itself. Each plugin skill dispatches to `codex exec --full-auto` and lets Codex's `imagegen` skill drive the built-in `image_gen` tool, save the final artifact, and print a `SAVED: <path>` line for each output.
+The plugin does not implement image generation itself. Each plugin skill dispatches to `codex exec --full-auto` and lets Codex's `imagegen` skill drive the built-in `image_gen` tool, use attached reference/edit images, save the final artifact, and print a `SAVED: <path>` line for each output.
 
 ## Requirements
 
 - Claude Code with plugin support.
-- `@openai/codex` CLI v0.124.0 or later.
+- `@openai/codex` CLI v0.142.0 or later (v0.144+ recommended — it moves image generation to the extension-backed tool the instruction prefixes are written for).
 - An active `codex login` session.
 - Node.js 18.18 or later.
 
@@ -42,11 +42,14 @@ Then restart Claude Code if needed. Default install scope is `user`; pass `--sco
 ```bash
 /codex-image:status
 /codex-image:generate "A watercolor moonlit library, save to images/library.png at 1024x1024"
+/codex-image:generate --ref style.png --ref "character ref.png" "A 9:16 scene using those references, save to images/scene.png"
 /codex-image:generate "5 logo variations of a brass compass on white, save under images/logos/"
 /codex-image:edit input.png "Replace the background with a clean white studio backdrop, save to edited.png"
 ```
 
-The full slash-command argument string is passed verbatim to Codex's `imagegen` skill. Express output paths, sizes, quality, count, transparency, etc. as natural language inside the prompt — `imagegen` interprets them. Defaults: when no path is specified, files land under `./codex-images/<UTC-timestamp>-<n>.png`.
+Apart from leading reference-image flags on `generate` and the input-path split on `edit`, the natural-language prompt is passed through to Codex's `imagegen` skill. Express output paths, sizes, quality, count, transparency, etc. as natural language inside the prompt — `imagegen` interprets them. Defaults: when no path is specified, files land under `./codex-images/<UTC-timestamp>-<n>.png`.
+
+For `/codex-image:generate`, leading `--ref <path>`, `--reference <path>`, or `--image <path>` arguments are attached to the Codex turn via `codex exec --image` and treated as generation references, not edit targets. Repeat the flag for multiple references (at most 5 — the built-in image tool's reference cap). Quote paths with spaces. Use `--` before the prompt if the prompt itself starts with a flag-like token.
 
 For `/codex-image:edit`, the first whitespace-separated token is the input image path. Quote it if the path contains spaces (e.g. `/codex-image:edit "my photo.png" tint blue`).
 
