@@ -15,7 +15,7 @@ This plugin is intentionally narrow: **image generation only**, dispatching to C
 Requirements:
 
 - Node.js 18.18+
-- `@openai/codex` CLI v0.124.0+ with an active `codex login` session
+- `@openai/codex` CLI v0.142.0+ (v0.144+ recommended) with an active `codex login` session
 - Claude Code with plugin support
 
 Local plugin dev loop:
@@ -39,6 +39,7 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) before making non-trivial ch
 
 ## PR conventions
 
+- **For features, open an issue first.** Bug-fix PRs are welcome directly, but for new behavior (flags, skills, instruction changes) please open a feature-request issue and get a nod before writing code. The maintainer may be working on overlapping changes or tracking an upstream Codex CLI contract change that affects the design — a quick issue avoids parallel work being wasted on either side.
 - Branch off `main`. Keep changes scoped — one PR per concern.
 - Run `npm test` and `npm run validate:plugin` before submitting.
 - If you change a SKILL.md heredoc or a `codex exec` invocation, update the matching **Load-bearing edge cases** entry in `docs/ARCHITECTURE.md` in the same PR.
