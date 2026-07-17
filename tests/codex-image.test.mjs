@@ -6,10 +6,53 @@ import {
   buildGenerateInstruction,
   compareSemver,
   parseGenerateArguments,
+  parseModelCatalog,
+  selectOrchestratorFromLadder,
+  resolveImageOrchestrator,
+  orchestratorArgs,
   resolveCodex,
   splitFirstToken,
   timestampForFile
 } from "../scripts/codex-image.mjs";
+
+// A trimmed-down `codex debug models` catalog: luna caps at max (no ultra), terra and
+// sol carry high, and codex-auto-review is hidden (visibility != "list").
+const SAMPLE_CATALOG_JSON = JSON.stringify({
+  models: [
+    {
+      slug: "gpt-5.6-sol",
+      visibility: "list",
+      supported_reasoning_levels: [
+        { effort: "low" },
+        { effort: "medium" },
+        { effort: "high" },
+        { effort: "xhigh" },
+        { effort: "max" },
+        { effort: "ultra" }
+      ]
+    },
+    {
+      slug: "gpt-5.6-terra",
+      visibility: "list",
+      supported_reasoning_levels: [{ effort: "low" }, { effort: "medium" }, { effort: "high" }]
+    },
+    {
+      slug: "gpt-5.6-luna",
+      visibility: "list",
+      supported_reasoning_levels: [
+        { effort: "low" },
+        { effort: "medium" },
+        { effort: "high" },
+        { effort: "max" }
+      ]
+    },
+    {
+      slug: "codex-auto-review",
+      visibility: "hide",
+      supported_reasoning_levels: [{ effort: "medium" }]
+    }
+  ]
+});
 
 test("compareSemver handles prefixed command output", () => {
   assert.equal(compareSemver("codex-cli 0.124.0", "0.124.0"), 0);
@@ -117,4 +160,150 @@ test("buildEditInstruction names the edit target's absolute path", () => {
 
 test("resolveCodex uses the bare codex command outside Windows", { skip: process.platform === "win32" }, () => {
   assert.deepEqual(resolveCodex(), { command: "codex", prefix: [] });
+});
+
+test("parseModelCatalog keeps only visibility=list models and their efforts", () => {
+  const catalog = parseModelCatalog(SAMPLE_CATALOG_JSON);
+  assert.equal(catalog.size, 3);
+  assert.ok(catalog.has("gpt-5.6-luna"));
+  assert.ok(catalog.get("gpt-5.6-luna").has("high"));
+  assert.ok(!catalog.get("gpt-5.6-luna").has("ultra"));
+  assert.ok(catalog.get("gpt-5.6-sol").has("ultra"));
+  assert.ok(!catalog.has("codex-auto-review"));
+});
+
+test("parseModelCatalog tolerates a leading banner before the JSON object", () => {
+  const catalog = parseModelCatalog(`noise line\n${SAMPLE_CATALOG_JSON}`);
+  assert.ok(catalog.has("gpt-5.6-terra"));
+});
+
+test("parseModelCatalog returns an empty map on unusable input", () => {
+  assert.equal(parseModelCatalog("").size, 0);
+  assert.equal(parseModelCatalog("not json").size, 0);
+  assert.equal(parseModelCatalog('{"models":"nope"}').size, 0);
+});
+
+test("selectOrchestratorFromLadder picks the top available rung (luna high)", () => {
+  const catalog = parseModelCatalog(SAMPLE_CATALOG_JSON);
+  assert.deepEqual(selectOrchestratorFromLadder(catalog), {
+    model: "gpt-5.6-luna",
+    effort: "high"
+  });
+});
+
+test("selectOrchestratorFromLadder falls to terra medium when luna is absent", () => {
+  const catalog = new Map([
+    ["gpt-5.6-terra", new Set(["low", "medium", "high"])],
+    ["gpt-5.6-sol", new Set(["low", "high"])]
+  ]);
+  assert.deepEqual(selectOrchestratorFromLadder(catalog), {
+    model: "gpt-5.6-terra",
+    effort: "medium"
+  });
+});
+
+test("selectOrchestratorFromLadder skips a rung whose effort is unsupported", () => {
+  // luna present but without "high" -> skip luna high, land on terra medium.
+  const catalog = new Map([
+    ["gpt-5.6-luna", new Set(["low", "medium"])],
+    ["gpt-5.6-terra", new Set(["low", "medium", "high"])]
+  ]);
+  assert.deepEqual(selectOrchestratorFromLadder(catalog), {
+    model: "gpt-5.6-terra",
+    effort: "medium"
+  });
+});
+
+test("selectOrchestratorFromLadder returns null with no catalog or no match", () => {
+  assert.equal(selectOrchestratorFromLadder(null), null);
+  assert.equal(selectOrchestratorFromLadder(new Map()), null);
+  assert.equal(selectOrchestratorFromLadder(new Map([["gpt-9.9", new Set(["high"])]])), null);
+});
+
+test("resolveImageOrchestrator uses the ladder when no env override is set", () => {
+  const catalog = parseModelCatalog(SAMPLE_CATALOG_JSON);
+  assert.deepEqual(resolveImageOrchestrator({ catalog }), {
+    model: "gpt-5.6-luna",
+    effort: "high",
+    source: "ladder"
+  });
+});
+
+test("resolveImageOrchestrator returns null when the ladder finds nothing", () => {
+  assert.equal(resolveImageOrchestrator({ catalog: new Map() }), null);
+  assert.equal(resolveImageOrchestrator({ catalog: null }), null);
+});
+
+test("resolveImageOrchestrator honors an explicit env override and lowercases effort", () => {
+  assert.deepEqual(
+    resolveImageOrchestrator({ envModel: "gpt-5.6-terra", envEffort: "High", catalog: new Map() }),
+    { model: "gpt-5.6-terra", effort: "high", source: "env" }
+  );
+});
+
+test("resolveImageOrchestrator requires both override vars together", () => {
+  assert.throws(
+    () => resolveImageOrchestrator({ envModel: "gpt-5.6-terra" }),
+    /must be set together/
+  );
+  assert.throws(() => resolveImageOrchestrator({ envEffort: "high" }), /must be set together/);
+});
+
+test("resolveImageOrchestrator rejects an invalid override effort", () => {
+  assert.throws(
+    () => resolveImageOrchestrator({ envModel: "gpt-5.6-terra", envEffort: "turbo" }),
+    /Invalid CODEX_IMAGE_EFFORT/
+  );
+});
+
+test("isOrchestratorRejection matches the live 0.144.5 rejection shape", async () => {
+  const { isOrchestratorRejection } = await import("../scripts/codex-image.mjs");
+  // Captured verbatim from codex-cli 0.144.5 with a bogus -m slug.
+  assert.equal(
+    isOrchestratorRejection(
+      `ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'totally-bogus-model-xyz' model is not supported when using Codex with a ChatGPT account."}}`
+    ),
+    true
+  );
+});
+
+test("isOrchestratorRejection matches other known model/effort rejection shapes", async () => {
+  const { isOrchestratorRejection } = await import("../scripts/codex-image.mjs");
+  assert.equal(isOrchestratorRejection("model gpt-5.6-luna is not available for this account"), true);
+  assert.equal(isOrchestratorRejection("Unknown model: gpt-5.6-luna"), true);
+  assert.equal(isOrchestratorRejection('{"code":"model_not_found"}'), true);
+  assert.equal(isOrchestratorRejection("The model 'gpt-5.6-luna' does not exist"), true);
+  assert.equal(isOrchestratorRejection("unsupported reasoning effort: high"), true);
+  assert.equal(isOrchestratorRejection("invalid value for model_reasoning_effort"), true);
+});
+
+test("isOrchestratorRejection ignores unrelated failures", async () => {
+  const { isOrchestratorRejection } = await import("../scripts/codex-image.mjs");
+  assert.equal(isOrchestratorRejection("you've hit your usage limit"), false);
+  assert.equal(isOrchestratorRejection("stream disconnected before completion"), false);
+  assert.equal(isOrchestratorRejection("401 Unauthorized: please run codex login"), false);
+  assert.equal(isOrchestratorRejection(""), false);
+  assert.equal(isOrchestratorRejection(null), false);
+});
+
+test("base exec args pin sandbox mode and the explicit approval-never override", async () => {
+  const { CODEX_EXEC_BASE_ARGS } = await import("../scripts/codex-image.mjs");
+  assert.deepEqual(CODEX_EXEC_BASE_ARGS, [
+    "exec",
+    "--sandbox",
+    "workspace-write",
+    "-c",
+    'approval_policy="never"',
+    "--skip-git-repo-check"
+  ]);
+});
+
+test("orchestratorArgs builds -m/-c with a TOML-quoted effort, or [] when null", () => {
+  assert.deepEqual(orchestratorArgs({ model: "gpt-5.6-luna", effort: "high" }), [
+    "-m",
+    "gpt-5.6-luna",
+    "-c",
+    'model_reasoning_effort="high"'
+  ]);
+  assert.deepEqual(orchestratorArgs(null), []);
 });

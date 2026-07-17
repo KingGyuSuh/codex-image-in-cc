@@ -8,6 +8,8 @@ allowed-tools: Bash(node:*)
 
 Leading `--ref <path>`, `--reference <path>`, or `--image <path>` arguments are reference images for generation, not edit targets. Repeat the flag for multiple references (max 5); quote paths with spaces.
 
+This command runs a full Codex agent turn and typically takes 1–3 minutes (longer for multiple images). Run it with a 10-minute Bash timeout (600000 ms) so the turn is not killed mid-generation.
+
 Run:
 
 ```bash
