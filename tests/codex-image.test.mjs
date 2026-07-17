@@ -256,6 +256,36 @@ test("resolveImageOrchestrator rejects an invalid override effort", () => {
   );
 });
 
+test("isOrchestratorRejection matches the live 0.144.5 rejection shape", async () => {
+  const { isOrchestratorRejection } = await import("../scripts/codex-image.mjs");
+  // Captured verbatim from codex-cli 0.144.5 with a bogus -m slug.
+  assert.equal(
+    isOrchestratorRejection(
+      `ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'totally-bogus-model-xyz' model is not supported when using Codex with a ChatGPT account."}}`
+    ),
+    true
+  );
+});
+
+test("isOrchestratorRejection matches other known model/effort rejection shapes", async () => {
+  const { isOrchestratorRejection } = await import("../scripts/codex-image.mjs");
+  assert.equal(isOrchestratorRejection("model gpt-5.6-luna is not available for this account"), true);
+  assert.equal(isOrchestratorRejection("Unknown model: gpt-5.6-luna"), true);
+  assert.equal(isOrchestratorRejection('{"code":"model_not_found"}'), true);
+  assert.equal(isOrchestratorRejection("The model 'gpt-5.6-luna' does not exist"), true);
+  assert.equal(isOrchestratorRejection("unsupported reasoning effort: high"), true);
+  assert.equal(isOrchestratorRejection("invalid value for model_reasoning_effort"), true);
+});
+
+test("isOrchestratorRejection ignores unrelated failures", async () => {
+  const { isOrchestratorRejection } = await import("../scripts/codex-image.mjs");
+  assert.equal(isOrchestratorRejection("you've hit your usage limit"), false);
+  assert.equal(isOrchestratorRejection("stream disconnected before completion"), false);
+  assert.equal(isOrchestratorRejection("401 Unauthorized: please run codex login"), false);
+  assert.equal(isOrchestratorRejection(""), false);
+  assert.equal(isOrchestratorRejection(null), false);
+});
+
 test("base exec args pin sandbox mode and the explicit approval-never override", async () => {
   const { CODEX_EXEC_BASE_ARGS } = await import("../scripts/codex-image.mjs");
   assert.deepEqual(CODEX_EXEC_BASE_ARGS, [

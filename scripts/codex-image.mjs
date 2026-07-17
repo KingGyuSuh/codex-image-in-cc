@@ -159,6 +159,7 @@ function runSync(command, args, options = {}) {
     input: options.input,
     stdio: "pipe",
     maxBuffer: options.maxBuffer,
+    timeout: options.timeout,
     windowsHide: true
   });
 
@@ -231,13 +232,21 @@ function parseModelCatalog(text) {
   return catalog;
 }
 
+// The catalog probe runs synchronously before every generate/edit dispatch, so it
+// must be bounded: a stalled `codex debug models` (bad network/proxy, hung catalog
+// refresh) would otherwise block the slash command before the image turn ever
+// starts. On timeout, spawnSync kills the probe and reports a non-zero/null status,
+// which the caller already treats as "catalog unavailable" -> codex config default.
+const CATALOG_PROBE_TIMEOUT_MS = 15_000;
+
 // Query the account's live model catalog. Best-effort and side-effect free: any
-// failure (codex missing, not logged in, offline) returns null and the caller uses
-// the codex config default rather than failing the generate/edit.
+// failure (codex missing, not logged in, offline, probe timeout) returns null and
+// the caller uses the codex config default rather than failing the generate/edit.
 function loadModelCatalog(cwd) {
   const result = runSync(CODEX.command, [...CODEX.prefix, "debug", "models"], {
     cwd,
-    maxBuffer: 32 * 1024 * 1024
+    maxBuffer: 32 * 1024 * 1024,
+    timeout: CATALOG_PROBE_TIMEOUT_MS
   });
   if (!result.available || result.status !== 0) {
     return null;
@@ -294,6 +303,21 @@ function resolveOrchestrator(cwd) {
   const hasEnv = Boolean(envModel?.trim()) || Boolean(envEffort?.trim());
   const catalog = hasEnv ? null : loadModelCatalog(cwd);
   return resolveImageOrchestrator({ envModel, envEffort, catalog });
+}
+
+// Signature of codex rejecting the requested orchestrator model/effort at turn
+// start — e.g. a custom `model_provider` that does not serve an official slug the
+// account catalog still lists, or an account losing access between probe and spawn.
+// Matched only on a non-zero exit. Live shape on 0.144.5 (ChatGPT account):
+//   ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error",
+//   "message":"The 'X' model is not supported when using Codex with a ChatGPT account."}}
+// The broader alternates mirror chaptern's battle-tested classifier for the same
+// failure class (not available / unknown model / bad reasoning effort).
+const ORCHESTRATOR_REJECTION_PATTERN =
+  /(?:\bmodel\b[^\n]{0,240}\b(?:not supported|unsupported|not available|unavailable|does not exist|not found)\b)|(?:\bunknown model\b)|(?:\bmodel_not_found\b)|(?:\b(?:unsupported|invalid|unavailable)\b[^\n]{0,120}\breasoning effort\b)|(?:\breasoning effort\b[^\n]{0,160}\b(?:not supported|unsupported|unavailable|invalid)\b)|(?:\binvalid value\b[^\n]{0,120}\bmodel_reasoning_effort\b)/i;
+
+function isOrchestratorRejection(stderrText) {
+  return ORCHESTRATOR_REJECTION_PATTERN.test(String(stderrText ?? ""));
 }
 
 // codex exec flags for a resolved orchestrator ([] when null => codex config default).
@@ -561,19 +585,52 @@ User edit request:
 ${prompt}`;
 }
 
-function spawnCodex(args, cwd) {
+function spawnCodex(args, cwd, options = {}) {
   return new Promise((resolve, reject) => {
+    // teeStderr pipes stderr through this process (the user still sees codex's live
+    // output) while keeping a bounded tail so a failed attempt can be classified.
+    const teeStderr = Boolean(options.teeStderr);
     const child = spawn(CODEX.command, [...CODEX.prefix, ...args], {
       cwd,
       env: process.env,
-      stdio: ["ignore", "inherit", "inherit"],
+      stdio: ["ignore", "inherit", teeStderr ? "pipe" : "inherit"],
       windowsHide: true
     });
+    let stderrTail = "";
+    if (teeStderr) {
+      child.stderr.on("data", (chunk) => {
+        process.stderr.write(chunk);
+        stderrTail = (stderrTail + chunk.toString("utf8")).slice(-4000);
+      });
+    }
     child.on("error", reject);
     child.on("close", (status, signal) => {
-      resolve({ status: status ?? (signal ? 1 : 0) });
+      resolve({ status: status ?? (signal ? 1 : 0), stderrTail });
     });
   });
+}
+
+// Run one image turn. A ladder-selected orchestrator is best-effort at spawn time
+// too: the catalog can list a model the actual backend refuses (e.g. a custom
+// `model_provider` that does not serve official slugs). Such a rejection kills the
+// turn at startup — before the image tool runs, so no image tokens are spent — and
+// the wrapper retries once with no -m/-c, i.e. the codex config default that worked
+// before the ladder existed. An env-forced orchestrator (source "env") never falls
+// back: the user asserted that exact pair, so the error must surface instead.
+async function runImageTurn(orchestrator, tailArgs, cwd) {
+  const ladder = orchestrator?.source === "ladder";
+  const first = await spawnCodex(
+    [...CODEX_EXEC_BASE_ARGS, ...orchestratorArgs(orchestrator), ...tailArgs],
+    cwd,
+    { teeStderr: ladder }
+  );
+  if (ladder && first.status !== 0 && isOrchestratorRejection(first.stderrTail)) {
+    console.error(
+      `codex rejected the ladder orchestrator ${orchestrator.model} (effort ${orchestrator.effort}); retrying with the codex config default.`
+    );
+    return spawnCodex([...CODEX_EXEC_BASE_ARGS, ...tailArgs], cwd);
+  }
+  return first;
 }
 
 async function handleGenerate(argv) {
@@ -614,12 +671,12 @@ async function handleGenerate(argv) {
       `codex image orchestrator: ${orchestrator.model} (effort ${orchestrator.effort}) [${orchestrator.source}]`
     );
   }
-  const codexArgs = [...CODEX_EXEC_BASE_ARGS, ...orchestratorArgs(orchestrator)];
+  const tailArgs = [];
   for (const imagePath of referenceImagePaths) {
-    codexArgs.push("--image", imagePath);
+    tailArgs.push("--image", imagePath);
   }
-  codexArgs.push("-C", cwd, "--", buildGenerateInstruction(prompt, referenceImagePaths));
-  const result = await spawnCodex(codexArgs, cwd);
+  tailArgs.push("-C", cwd, "--", buildGenerateInstruction(prompt, referenceImagePaths));
+  const result = await runImageTurn(orchestrator, tailArgs, cwd);
   if (result.status !== 0) {
     process.exitCode = result.status;
   }
@@ -655,17 +712,8 @@ async function handleEdit(argv) {
       `codex image orchestrator: ${orchestrator.model} (effort ${orchestrator.effort}) [${orchestrator.source}]`
     );
   }
-  const codexArgs = [
-    ...CODEX_EXEC_BASE_ARGS,
-    ...orchestratorArgs(orchestrator),
-    "--image",
-    inputPath,
-    "-C",
-    cwd,
-    "--",
-    buildEditInstruction(inputPath, prompt)
-  ];
-  const result = await spawnCodex(codexArgs, cwd);
+  const tailArgs = ["--image", inputPath, "-C", cwd, "--", buildEditInstruction(inputPath, prompt)];
+  const result = await runImageTurn(orchestrator, tailArgs, cwd);
   if (result.status !== 0) {
     process.exitCode = result.status;
   }
@@ -731,7 +779,9 @@ async function main(argv = process.argv.slice(2)) {
   throw new Error(`Unknown command "${command}".\n${usage()}`);
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+// argv[1] is undefined when this module is imported from `node -e` / a REPL —
+// guard it so importing never crashes on the entry-point check itself.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
     console.error(`Error: ${error.message}`);
     process.exit(1);
@@ -750,6 +800,8 @@ export {
   selectOrchestratorFromLadder,
   resolveImageOrchestrator,
   orchestratorArgs,
+  isOrchestratorRejection,
+  runImageTurn,
   CODEX_EXEC_BASE_ARGS,
   CODEX_IMAGE_ORCHESTRATOR_LADDER,
   renderStatusReport,
