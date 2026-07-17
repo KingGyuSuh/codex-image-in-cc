@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `generate` and `edit` now spawn `codex exec --sandbox workspace-write` instead of the deprecated `--full-auto`. Codex CLI 0.144.5 warns that `--full-auto` is deprecated and has dropped it from `codex exec --help`; both spellings resolve to the same `workspace-write` sandbox with `approval: never`, so behavior is unchanged and the warning is gone. `/codex-image:status` checks the new flag accordingly.
+- `generate` and `edit` now spawn `codex exec --sandbox workspace-write -c approval_policy="never"` instead of the deprecated `--full-auto`. Codex CLI 0.144.5 warns that `--full-auto` is deprecated and has dropped it from `codex exec --help`. The explicit `approval_policy` override preserves the old `--full-auto` approval-never contract for configs with `approvals_reviewer = "auto_review"`, where bare `--sandbox workspace-write` would drop the headless approval-never default and route imagegen's shell steps through the reviewer (verified on 0.144.5; flagged by Codex review on the PR). For all other configs the override is a no-op. `/codex-image:status` checks the new flag accordingly.
 - `status --json`: the `fullAuto` field is renamed to `headlessExec` to match the flag it now verifies.
 - `generate` / `edit` SKILL.md now tell the invoking model to run the command with a 10-minute Bash timeout (600000 ms): an image turn typically takes 1–3 minutes, and the default 2-minute Bash timeout can kill it mid-generation (observed live — the skill reported "in progress" and produced no file).
 

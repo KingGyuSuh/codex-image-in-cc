@@ -256,6 +256,18 @@ test("resolveImageOrchestrator rejects an invalid override effort", () => {
   );
 });
 
+test("base exec args pin sandbox mode and the explicit approval-never override", async () => {
+  const { CODEX_EXEC_BASE_ARGS } = await import("../scripts/codex-image.mjs");
+  assert.deepEqual(CODEX_EXEC_BASE_ARGS, [
+    "exec",
+    "--sandbox",
+    "workspace-write",
+    "-c",
+    'approval_policy="never"',
+    "--skip-git-repo-check"
+  ]);
+});
+
 test("orchestratorArgs builds -m/-c with a TOML-quoted effort, or [] when null", () => {
   assert.deepEqual(orchestratorArgs({ model: "gpt-5.6-luna", effort: "high" }), [
     "-m",

@@ -151,11 +151,13 @@ The flags are repeatable up to 5 references — the built-in image tool caps ref
 
 This keeps reference images mechanical while preserving the "natural language owns output control" rule: sizes, counts, quality, output paths, transparency, and creative direction still live inside the remaining prompt and are interpreted by `imagegen`.
 
-### Sandbox mode, not `--full-auto`
+### Sandbox mode, not `--full-auto` — and an explicit approval override
 
-The wrapper passes `--sandbox workspace-write`. Headless `codex exec` resolves that to `approval: never` with `[workdir, /tmp, $TMPDIR]` writable — everything the `imagegen` flow needs to run `mkdir` / `cp` / `sips`, copy the selected output out of `~/.codex/generated_images/...`, and resize the final artifact.
+The wrapper passes `--sandbox workspace-write -c approval_policy="never"`. Headless `codex exec` resolves that to `approval: never` with `[workdir, /tmp, $TMPDIR]` writable — everything the `imagegen` flow needs to run `mkdir` / `cp` / `sips`, copy the selected output out of `~/.codex/generated_images/...`, and resize the final artifact.
 
-Earlier versions of this plugin passed `--full-auto`, which resolved to the same workspace-write sandbox. Codex CLI 0.144.5 deprecates that spelling (`warning: --full-auto is deprecated; use --sandbox workspace-write instead`) and has already removed it from `codex exec --help`, so the explicit sandbox flag is now the documented contract. Verified on 0.144.5: the session header reports the same `sandbox: workspace-write [workdir, /tmp, $TMPDIR]` and `approval: never`, model-issued shell commands execute, workspace writes land, and the deprecation warning is gone.
+Earlier versions of this plugin passed `--full-auto`, which resolved to the same workspace-write sandbox. Codex CLI 0.144.5 deprecates that spelling (`warning: --full-auto is deprecated; use --sandbox workspace-write instead`) and has already removed it from `codex exec --help`, so the explicit sandbox flag is now the documented contract.
+
+The explicit `-c approval_policy="never"` is load-bearing, not decoration. `codex exec` defaults headless runs to approval-never via a harness override, but `build_exec_config` (codex-rs `exec/src/lib.rs`) drops that override — rebuilding with `approval_policy: None` — when the resolved config sets `approvals_reviewer = "auto_review"`, unless the legacy `--full-auto` / bypass flag set `preserve_headless_approval_policy`. Bare `--sandbox workspace-write` does not set that flag. Verified on 0.144.5 with an isolated config: `--full-auto` + auto_review keeps `approval: never`, bare `--sandbox workspace-write` + auto_review flips the header to `approval: on-request` (which would route imagegen's shell steps through the reviewer), and adding `-c approval_policy="never"` restores `approval: never`. For accounts without auto_review the override is a no-op — the resolved policy is `never` either way.
 
 Do not use the undocumented `--yolo`, and do not reach for `--dangerously-bypass-approvals-and-sandbox` — image generation only ever needs to write inside the workspace.
 

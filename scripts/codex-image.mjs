@@ -46,6 +46,23 @@ const CODEX_REASONING_EFFORTS = new Set([
 const ORCHESTRATOR_MODEL_ENV = "CODEX_IMAGE_MODEL";
 const ORCHESTRATOR_EFFORT_ENV = "CODEX_IMAGE_EFFORT";
 
+// Base headless exec invocation shared by generate and edit. The explicit
+// `-c approval_policy="never"` matters: bare `--sandbox workspace-write` drops the
+// headless approval-never override when the user's config sets
+// `approvals_reviewer = "auto_review"` (codex-rs build_exec_config rebuilds with
+// approval_policy: None; verified on 0.144.5 — the header flips to `approval:
+// on-request`), which would route imagegen's mkdir/cp/sips through the reviewer.
+// The deprecated `--full-auto` preserved approval-never implicitly; this keeps
+// that contract with the documented sandbox flag.
+const CODEX_EXEC_BASE_ARGS = [
+  "exec",
+  "--sandbox",
+  "workspace-write",
+  "-c",
+  'approval_policy="never"',
+  "--skip-git-repo-check"
+];
+
 // On Windows, `spawn("codex", ...)` misses the npm `codex.cmd` shim (ENOENT) and
 // Node 20+ refuses to spawn `.cmd` directly without a shell (EINVAL, post
 // CVE-2024-27980 hardening). Shelling out would re-expose user prompts to cmd.exe
@@ -597,13 +614,7 @@ async function handleGenerate(argv) {
       `codex image orchestrator: ${orchestrator.model} (effort ${orchestrator.effort}) [${orchestrator.source}]`
     );
   }
-  const codexArgs = [
-    "exec",
-    "--sandbox",
-    "workspace-write",
-    "--skip-git-repo-check",
-    ...orchestratorArgs(orchestrator)
-  ];
+  const codexArgs = [...CODEX_EXEC_BASE_ARGS, ...orchestratorArgs(orchestrator)];
   for (const imagePath of referenceImagePaths) {
     codexArgs.push("--image", imagePath);
   }
@@ -645,10 +656,7 @@ async function handleEdit(argv) {
     );
   }
   const codexArgs = [
-    "exec",
-    "--sandbox",
-    "workspace-write",
-    "--skip-git-repo-check",
+    ...CODEX_EXEC_BASE_ARGS,
     ...orchestratorArgs(orchestrator),
     "--image",
     inputPath,
@@ -742,6 +750,7 @@ export {
   selectOrchestratorFromLadder,
   resolveImageOrchestrator,
   orchestratorArgs,
+  CODEX_EXEC_BASE_ARGS,
   CODEX_IMAGE_ORCHESTRATOR_LADDER,
   renderStatusReport,
   splitFirstToken,
