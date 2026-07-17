@@ -6,14 +6,14 @@
   },
   "metadata": {
     "description": "Claude Code plugin that generates and edits images through Codex CLI's built-in imagegen skill.",
-    "version": "0.1.0"
+    "version": "0.3.0"
   },
   "plugins": [
     {
       "name": "codex-image",
       "source": "./",
       "description": "Generate and edit images from Claude Code by dispatching to Codex CLI's built-in imagegen skill.",
-      "version": "0.1.0",
+      "version": "0.3.0",
       "tags": ["codex", "image-generation", "imagegen", "claude-code"],
       "category": "productivity"
     }

@@ -13,6 +13,39 @@ const MIN_CODEX_VERSION = "0.142.0";
 // request (schema-enforced via `referenced_image_paths` since codex 0.144).
 const MAX_REFERENCE_IMAGES = 5;
 
+// Image generation is driven by an agent turn (the "orchestrator") that calls the
+// built-in image_gen tool; a stronger orchestrator interprets the prompt, conditions
+// references, and holds the requested aspect more reliably. Rather than hardcode one
+// model — which would break accounts that cannot access it (e.g. ChatGPT Free) — the
+// wrapper queries the account's live model catalog via `codex debug models` and picks
+// the FIRST ladder rung whose model is listed and whose effort that model supports.
+// If the catalog is unavailable or no rung matches, no model/effort is forced and
+// codex falls back to its own config default (the pre-ladder behavior), so this never
+// regresses generation.
+const CODEX_IMAGE_ORCHESTRATOR_LADDER = [
+  { model: "gpt-5.6-luna", effort: "high" },
+  { model: "gpt-5.6-terra", effort: "medium" },
+  { model: "gpt-5.6-sol", effort: "high" },
+  { model: "gpt-5.6-sol", effort: "low" }
+];
+
+// Reasoning efforts codex accepts, used only to validate an explicit env override.
+const CODEX_REASONING_EFFORTS = new Set([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra"
+]);
+
+// Explicit override: set BOTH to force a specific orchestrator, bypassing the ladder
+// and the catalog probe (the user is asserting the model is available to them).
+const ORCHESTRATOR_MODEL_ENV = "CODEX_IMAGE_MODEL";
+const ORCHESTRATOR_EFFORT_ENV = "CODEX_IMAGE_EFFORT";
+
 // On Windows, `spawn("codex", ...)` misses the npm `codex.cmd` shim (ENOENT) and
 // Node 20+ refuses to spawn `.cmd` directly without a shell (EINVAL, post
 // CVE-2024-27980 hardening). Shelling out would re-expose user prompts to cmd.exe
@@ -108,6 +141,7 @@ function runSync(command, args, options = {}) {
     encoding: "utf8",
     input: options.input,
     stdio: "pipe",
+    maxBuffer: options.maxBuffer,
     windowsHide: true
   });
 
@@ -130,6 +164,156 @@ function findImagegenSkill() {
   return fs.existsSync(candidate) ? candidate : null;
 }
 
+// ---------------------------------------------------------------------------
+// Image orchestrator selection (model + reasoning effort)
+// ---------------------------------------------------------------------------
+
+// Parse `codex debug models` JSON into slug -> Set(supported efforts), keeping only
+// account-selectable models (visibility "list"). Best-effort: returns an empty Map on
+// any shape it does not recognize so callers fall back to the codex default.
+function parseModelCatalog(text) {
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed) {
+    return new Map();
+  }
+  let parsed = null;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    // `codex debug models` prints a single JSON object; if anything ever wraps it,
+    // fall back to the outermost object rather than giving up on selection.
+    const start = trimmed.indexOf("{");
+    const end = trimmed.lastIndexOf("}");
+    if (start !== -1 && end > start) {
+      try {
+        parsed = JSON.parse(trimmed.slice(start, end + 1));
+      } catch {
+        parsed = null;
+      }
+    }
+  }
+  const models = parsed && Array.isArray(parsed.models) ? parsed.models : null;
+  const catalog = new Map();
+  if (!models) {
+    return catalog;
+  }
+  for (const model of models) {
+    if (!model || typeof model.slug !== "string" || model.visibility !== "list") {
+      continue;
+    }
+    const efforts = new Set();
+    if (Array.isArray(model.supported_reasoning_levels)) {
+      for (const level of model.supported_reasoning_levels) {
+        if (level && typeof level.effort === "string") {
+          efforts.add(level.effort);
+        }
+      }
+    }
+    catalog.set(model.slug, efforts);
+  }
+  return catalog;
+}
+
+// Query the account's live model catalog. Best-effort and side-effect free: any
+// failure (codex missing, not logged in, offline) returns null and the caller uses
+// the codex config default rather than failing the generate/edit.
+function loadModelCatalog(cwd) {
+  const result = runSync(CODEX.command, [...CODEX.prefix, "debug", "models"], {
+    cwd,
+    maxBuffer: 32 * 1024 * 1024
+  });
+  if (!result.available || result.status !== 0) {
+    return null;
+  }
+  return parseModelCatalog(result.stdout);
+}
+
+// Walk the ladder top-to-bottom; return the first rung whose model is in the catalog
+// and whose effort that model supports. null if the catalog is missing or no rung fits.
+function selectOrchestratorFromLadder(catalog, ladder = CODEX_IMAGE_ORCHESTRATOR_LADDER) {
+  if (!catalog) {
+    return null;
+  }
+  for (const rung of ladder) {
+    const efforts = catalog.get(rung.model);
+    if (efforts && efforts.has(rung.effort)) {
+      return { model: rung.model, effort: rung.effort };
+    }
+  }
+  return null;
+}
+
+// Resolve the orchestrator from an explicit env override or the ladder+catalog.
+// Pure: the catalog is passed in, so this is unit-testable without spawning codex.
+// - Both env vars set   -> use them (effort validated), source "env".
+// - Exactly one env set -> throw (an override must be explicit on both axes).
+// - Neither env set     -> first available ladder rung, source "ladder"; null if none.
+function resolveImageOrchestrator({ envModel, envEffort, catalog } = {}) {
+  const model = typeof envModel === "string" ? envModel.trim() : "";
+  const effort = typeof envEffort === "string" ? envEffort.trim().toLowerCase() : "";
+  if (Boolean(model) !== Boolean(effort)) {
+    throw new Error(
+      `${ORCHESTRATOR_MODEL_ENV} and ${ORCHESTRATOR_EFFORT_ENV} must be set together so the image orchestrator override is explicit.`
+    );
+  }
+  if (model && effort) {
+    if (!CODEX_REASONING_EFFORTS.has(effort)) {
+      throw new Error(
+        `Invalid ${ORCHESTRATOR_EFFORT_ENV}=${effort}; expected one of ${[...CODEX_REASONING_EFFORTS].join("|")}.`
+      );
+    }
+    return { model, effort, source: "env" };
+  }
+  const picked = selectOrchestratorFromLadder(catalog);
+  return picked ? { ...picked, source: "ladder" } : null;
+}
+
+// Impure wrapper: read env, probe the catalog only when no env override is present
+// (the override bypasses the probe), and resolve. Throws only on an inconsistent env
+// override; a catalog failure degrades to the codex default (null).
+function resolveOrchestrator(cwd) {
+  const envModel = process.env[ORCHESTRATOR_MODEL_ENV];
+  const envEffort = process.env[ORCHESTRATOR_EFFORT_ENV];
+  const hasEnv = Boolean(envModel?.trim()) || Boolean(envEffort?.trim());
+  const catalog = hasEnv ? null : loadModelCatalog(cwd);
+  return resolveImageOrchestrator({ envModel, envEffort, catalog });
+}
+
+// codex exec flags for a resolved orchestrator ([] when null => codex config default).
+// The `-c` value is TOML: JSON.stringify quotes the effort so codex parses a string.
+function orchestratorArgs(orchestrator) {
+  if (!orchestrator) {
+    return [];
+  }
+  return [
+    "-m",
+    orchestrator.model,
+    "-c",
+    `model_reasoning_effort=${JSON.stringify(orchestrator.effort)}`
+  ];
+}
+
+// Human-readable orchestrator line for `status`. Never throws: an inconsistent env
+// override is surfaced as a not-ok row so status can flag it instead of crashing.
+function describeOrchestrator(cwd) {
+  try {
+    const orchestrator = resolveOrchestrator(cwd);
+    if (!orchestrator) {
+      return {
+        ok: true,
+        detail:
+          "codex config default (no ladder model available for this account; generation still works)"
+      };
+    }
+    return {
+      ok: true,
+      detail: `${orchestrator.model} (effort ${orchestrator.effort}) [${orchestrator.source}]`
+    };
+  } catch (error) {
+    return { ok: false, detail: error.message };
+  }
+}
+
 function buildStatusReport(options = {}) {
   const cwd = resolveCwd(options);
   const nodeVersion = process.versions.node;
@@ -145,15 +329,22 @@ function buildStatusReport(options = {}) {
   const loginText = loginStatus ? (loginStatus.stdout || loginStatus.stderr).trim() : "Codex unavailable";
   const loginOk = Boolean(loginStatus?.status === 0 && /logged in/i.test(loginText));
 
-  const fullAutoStatus = codexOk ? runSync(CODEX.command, [...CODEX.prefix, "exec", "--full-auto", "--help"], { cwd }) : null;
-  const fullAutoOk = Boolean(fullAutoStatus?.status === 0);
-  const execHelpText = `${fullAutoStatus?.stdout ?? ""}\n${fullAutoStatus?.stderr ?? ""}`;
-  const imageAttachmentOk = Boolean(fullAutoOk && /(^|\s)(-i,\s*)?--image(\s|=|<|$)/.test(execHelpText));
+  const headlessExecStatus = codexOk
+    ? runSync(CODEX.command, [...CODEX.prefix, "exec", "--sandbox", "workspace-write", "--help"], { cwd })
+    : null;
+  const headlessExecOk = Boolean(headlessExecStatus?.status === 0);
+  const execHelpText = `${headlessExecStatus?.stdout ?? ""}\n${headlessExecStatus?.stderr ?? ""}`;
+  const imageAttachmentOk = Boolean(headlessExecOk && /(^|\s)(-i,\s*)?--image(\s|=|<|$)/.test(execHelpText));
 
   const imagegenSkillPath = findImagegenSkill();
   const imagegenOk = Boolean(imagegenSkillPath);
 
-  const ready = nodeOk && codexOk && loginOk && fullAutoOk && imageAttachmentOk && imagegenOk;
+  const orchestrator = codexOk
+    ? describeOrchestrator(cwd)
+    : { ok: true, detail: "not checked (codex unavailable)" };
+
+  const ready =
+    nodeOk && codexOk && loginOk && headlessExecOk && imageAttachmentOk && imagegenOk && orchestrator.ok;
   const nextSteps = [];
   if (!nodeOk) {
     nextSteps.push(`Install Node.js ${MIN_NODE_VERSION} or newer.`);
@@ -166,14 +357,17 @@ function buildStatusReport(options = {}) {
   if (codexOk && !loginOk) {
     nextSteps.push("Run `codex login`.");
   }
-  if (codexOk && !fullAutoOk) {
-    nextSteps.push("This plugin depends on `codex exec --full-auto`; verify the installed Codex CLI still supports that documented alias.");
+  if (codexOk && !headlessExecOk) {
+    nextSteps.push("This plugin depends on `codex exec --sandbox workspace-write`; verify the installed Codex CLI still supports that documented mode.");
   }
-  if (codexOk && fullAutoOk && !imageAttachmentOk) {
+  if (codexOk && headlessExecOk && !imageAttachmentOk) {
     nextSteps.push("This plugin depends on `codex exec --image` for edit and reference-image input. Upgrade Codex CLI.");
   }
   if (!imagegenOk) {
     nextSteps.push("The Codex imagegen skill was not found under CODEX_HOME. Reinstall or update Codex CLI.");
+  }
+  if (codexOk && !orchestrator.ok) {
+    nextSteps.push(`Fix the image orchestrator override: ${orchestrator.detail}`);
   }
 
   return {
@@ -187,11 +381,11 @@ function buildStatusReport(options = {}) {
       minimum: MIN_CODEX_VERSION
     },
     login: { ok: loginOk, detail: loginText || "not logged in" },
-    fullAuto: {
-      ok: fullAutoOk,
-      detail: fullAutoOk
-        ? "`codex exec --full-auto` accepted"
-        : (fullAutoStatus?.stderr || fullAutoStatus?.stdout || "not checked").trim()
+    headlessExec: {
+      ok: headlessExecOk,
+      detail: headlessExecOk
+        ? "`codex exec --sandbox workspace-write` accepted"
+        : (headlessExecStatus?.stderr || headlessExecStatus?.stdout || "not checked").trim()
     },
     imageAttachment: {
       ok: imageAttachmentOk,
@@ -200,6 +394,7 @@ function buildStatusReport(options = {}) {
         : "not found in `codex exec --help`"
     },
     imagegenSkill: { ok: imagegenOk, path: imagegenSkillPath },
+    orchestrator,
     nextSteps
   };
 }
@@ -209,9 +404,10 @@ function renderStatusReport(report) {
   lines.push(statusLine(report.node.ok, "Node", `v${report.node.version} (minimum ${report.node.minimum})`));
   lines.push(statusLine(report.codex.ok, "Codex", `${report.codex.version} (minimum ${report.codex.minimum})`));
   lines.push(statusLine(report.login.ok, "Codex login", report.login.detail));
-  lines.push(statusLine(report.fullAuto.ok, "Headless exec", report.fullAuto.detail));
+  lines.push(statusLine(report.headlessExec.ok, "Headless exec", report.headlessExec.detail));
   lines.push(statusLine(report.imageAttachment.ok, "Image attachment", report.imageAttachment.detail));
   lines.push(statusLine(report.imagegenSkill.ok, "imagegen skill", report.imagegenSkill.path ?? "not found"));
+  lines.push(statusLine(report.orchestrator.ok, "Image orchestrator", report.orchestrator.detail));
   lines.push("");
   lines.push("Usage:");
   lines.push('  /codex-image:generate "A watercolor moonlit library, save to images/library.png at 1024x1024"');
@@ -388,10 +584,25 @@ async function handleGenerate(argv) {
     process.exitCode = 1;
     return;
   }
+  let orchestrator;
+  try {
+    orchestrator = resolveOrchestrator(cwd);
+  } catch (error) {
+    console.error(`Error: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (orchestrator) {
+    console.error(
+      `codex image orchestrator: ${orchestrator.model} (effort ${orchestrator.effort}) [${orchestrator.source}]`
+    );
+  }
   const codexArgs = [
     "exec",
-    "--full-auto",
+    "--sandbox",
+    "workspace-write",
     "--skip-git-repo-check",
+    ...orchestratorArgs(orchestrator)
   ];
   for (const imagePath of referenceImagePaths) {
     codexArgs.push("--image", imagePath);
@@ -420,10 +631,25 @@ async function handleEdit(argv) {
     process.exitCode = 1;
     return;
   }
+  let orchestrator;
+  try {
+    orchestrator = resolveOrchestrator(cwd);
+  } catch (error) {
+    console.error(`Error: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (orchestrator) {
+    console.error(
+      `codex image orchestrator: ${orchestrator.model} (effort ${orchestrator.effort}) [${orchestrator.source}]`
+    );
+  }
   const codexArgs = [
     "exec",
-    "--full-auto",
+    "--sandbox",
+    "workspace-write",
     "--skip-git-repo-check",
+    ...orchestratorArgs(orchestrator),
     "--image",
     inputPath,
     "-C",
@@ -512,6 +738,11 @@ export {
   compareSemver,
   parseSemver,
   parseGenerateArguments,
+  parseModelCatalog,
+  selectOrchestratorFromLadder,
+  resolveImageOrchestrator,
+  orchestratorArgs,
+  CODEX_IMAGE_ORCHESTRATOR_LADDER,
   renderStatusReport,
   splitFirstToken,
   timestampForFile

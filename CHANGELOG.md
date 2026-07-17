@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-17
+
+### Added
+
+- Image generation now selects a stronger **orchestrator model and reasoning effort** when the account has one. The wrapper probes `codex debug models` and passes `-m` / `-c model_reasoning_effort` for the first available rung of a preference ladder (`gpt-5.6-luna` high → `gpt-5.6-terra` medium → `gpt-5.6-sol` high → `gpt-5.6-sol` low). Accounts without those models (e.g. ChatGPT Free) or an offline probe transparently fall back to the Codex config default, so generation never regresses. Override with `CODEX_IMAGE_MODEL` + `CODEX_IMAGE_EFFORT` (both required, or the wrapper errors). `/codex-image:status` now reports the resolved orchestrator.
+
+### Changed
+
+- `generate` and `edit` now spawn `codex exec --sandbox workspace-write` instead of the deprecated `--full-auto`. Codex CLI 0.144.5 warns that `--full-auto` is deprecated and has dropped it from `codex exec --help`; both spellings resolve to the same `workspace-write` sandbox with `approval: never`, so behavior is unchanged and the warning is gone. `/codex-image:status` checks the new flag accordingly.
+- `status --json`: the `fullAuto` field is renamed to `headlessExec` to match the flag it now verifies.
+
 ## [0.2.0] - 2026-07-10
 
 ### Added

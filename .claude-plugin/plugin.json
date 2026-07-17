@@ -1,6 +1,6 @@
 {
   "name": "codex-image",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Generate and edit images from Claude Code by dispatching to Codex CLI's built-in imagegen skill.",
   "author": {
     "name": "KingGyuSuh",

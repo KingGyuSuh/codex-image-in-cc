@@ -35,7 +35,7 @@ claude --plugin-dir .
 
 ## Architecture
 
-Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) before making non-trivial changes. It covers the call flow, the load-bearing edge cases (SKILL.md verbatim caveat, stdin trap, `--full-auto`, `--skip-git-repo-check`, `SAVED:` line contract, edit input-path parsing), and the design rationale for keeping the Node wrapper thin.
+Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) before making non-trivial changes. It covers the call flow, the load-bearing edge cases (SKILL.md verbatim caveat, stdin trap, `--sandbox workspace-write`, `--skip-git-repo-check`, image orchestrator model ladder, `SAVED:` line contract, edit input-path parsing), and the design rationale for keeping the Node wrapper thin.
 
 ## PR conventions
 
