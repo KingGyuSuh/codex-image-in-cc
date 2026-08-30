@@ -124,6 +124,49 @@ function statusLine(ok, label, detail) {
   return `${ok ? "OK" : "FAIL"} ${label}: ${detail}`;
 }
 
+// Codex CLI 0.151.0 removed the `--full-auto` alias from `codex exec`
+// (`error: unexpected argument '--full-auto' found`), which broke every dispatch
+// this plugin makes. `-s workspace-write` selects the same sandbox policy and is
+// accepted by both the old and the new CLI, but `--full-auto` is kept as the
+// first choice so older installs keep their documented behaviour. Probe the
+// installed CLI rather than branching on the version string: the alias removal
+// is a flag-surface change, and the help exit code answers it directly.
+const HEADLESS_MODE_CANDIDATES = [
+  { label: "--full-auto", args: ["--full-auto"] },
+  { label: "-s workspace-write", args: ["-s", "workspace-write"] }
+];
+
+let headlessModeCache = null;
+
+// `run` is injectable so the fallback order stays unit-testable without a Codex install.
+function detectHeadlessMode(cwd, run = runSync) {
+  let detail = "not checked";
+  for (const candidate of HEADLESS_MODE_CANDIDATES) {
+    const probe = run(CODEX.command, [...CODEX.prefix, "exec", ...candidate.args, "--help"], { cwd });
+    if (!probe.available) {
+      return { ok: false, args: null, label: null, helpText: "", detail: "Codex CLI not found" };
+    }
+    if (probe.status === 0) {
+      return {
+        ok: true,
+        args: candidate.args,
+        label: candidate.label,
+        helpText: `${probe.stdout ?? ""}\n${probe.stderr ?? ""}`,
+        detail: `\`codex exec ${candidate.label}\` accepted`
+      };
+    }
+    detail = (probe.stderr || probe.stdout || `\`codex exec ${candidate.label}\` rejected`).trim();
+  }
+  return { ok: false, args: null, label: null, helpText: "", detail };
+}
+
+function resolveHeadlessMode(cwd) {
+  if (!headlessModeCache) {
+    headlessModeCache = detectHeadlessMode(cwd);
+  }
+  return headlessModeCache;
+}
+
 function findImagegenSkill() {
   const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
   const candidate = path.join(codexHome, "skills", ".system", "imagegen", "SKILL.md");
@@ -145,15 +188,17 @@ function buildStatusReport(options = {}) {
   const loginText = loginStatus ? (loginStatus.stdout || loginStatus.stderr).trim() : "Codex unavailable";
   const loginOk = Boolean(loginStatus?.status === 0 && /logged in/i.test(loginText));
 
-  const fullAutoStatus = codexOk ? runSync(CODEX.command, [...CODEX.prefix, "exec", "--full-auto", "--help"], { cwd }) : null;
-  const fullAutoOk = Boolean(fullAutoStatus?.status === 0);
-  const execHelpText = `${fullAutoStatus?.stdout ?? ""}\n${fullAutoStatus?.stderr ?? ""}`;
-  const imageAttachmentOk = Boolean(fullAutoOk && /(^|\s)(-i,\s*)?--image(\s|=|<|$)/.test(execHelpText));
+  const headless = codexOk ? resolveHeadlessMode(cwd) : null;
+  const headlessOk = Boolean(headless?.ok);
+  // Read from the help output of the invocation that actually succeeded: probing
+  // through a rejected flag reported `--image` as missing even where it exists.
+  const execHelpText = headless?.helpText ?? "";
+  const imageAttachmentOk = Boolean(headlessOk && /(^|\s)(-i,\s*)?--image(\s|=|<|$)/.test(execHelpText));
 
   const imagegenSkillPath = findImagegenSkill();
   const imagegenOk = Boolean(imagegenSkillPath);
 
-  const ready = nodeOk && codexOk && loginOk && fullAutoOk && imageAttachmentOk && imagegenOk;
+  const ready = nodeOk && codexOk && loginOk && headlessOk && imageAttachmentOk && imagegenOk;
   const nextSteps = [];
   if (!nodeOk) {
     nextSteps.push(`Install Node.js ${MIN_NODE_VERSION} or newer.`);
@@ -166,15 +211,21 @@ function buildStatusReport(options = {}) {
   if (codexOk && !loginOk) {
     nextSteps.push("Run `codex login`.");
   }
-  if (codexOk && !fullAutoOk) {
-    nextSteps.push("This plugin depends on `codex exec --full-auto`; verify the installed Codex CLI still supports that documented alias.");
+  if (codexOk && !headlessOk) {
+    nextSteps.push("Neither `codex exec --full-auto` nor `codex exec -s workspace-write` was accepted; check `codex exec --help` for the current headless sandbox flag.");
   }
-  if (codexOk && fullAutoOk && !imageAttachmentOk) {
+  if (codexOk && headlessOk && !imageAttachmentOk) {
     nextSteps.push("This plugin depends on `codex exec --image` for edit and reference-image input. Upgrade Codex CLI.");
   }
   if (!imagegenOk) {
     nextSteps.push("The Codex imagegen skill was not found under CODEX_HOME. Reinstall or update Codex CLI.");
   }
+
+  const headlessExec = {
+    ok: headlessOk,
+    mode: headless?.label ?? null,
+    detail: headless?.detail ?? "not checked"
+  };
 
   return {
     ready,
@@ -187,12 +238,9 @@ function buildStatusReport(options = {}) {
       minimum: MIN_CODEX_VERSION
     },
     login: { ok: loginOk, detail: loginText || "not logged in" },
-    fullAuto: {
-      ok: fullAutoOk,
-      detail: fullAutoOk
-        ? "`codex exec --full-auto` accepted"
-        : (fullAutoStatus?.stderr || fullAutoStatus?.stdout || "not checked").trim()
-    },
+    headlessExec,
+    // Deprecated alias for `--json` consumers written against 0.2.0.
+    fullAuto: headlessExec,
     imageAttachment: {
       ok: imageAttachmentOk,
       detail: imageAttachmentOk
@@ -209,7 +257,7 @@ function renderStatusReport(report) {
   lines.push(statusLine(report.node.ok, "Node", `v${report.node.version} (minimum ${report.node.minimum})`));
   lines.push(statusLine(report.codex.ok, "Codex", `${report.codex.version} (minimum ${report.codex.minimum})`));
   lines.push(statusLine(report.login.ok, "Codex login", report.login.detail));
-  lines.push(statusLine(report.fullAuto.ok, "Headless exec", report.fullAuto.detail));
+  lines.push(statusLine(report.headlessExec.ok, "Headless exec", report.headlessExec.detail));
   lines.push(statusLine(report.imageAttachment.ok, "Image attachment", report.imageAttachment.detail));
   lines.push(statusLine(report.imagegenSkill.ok, "imagegen skill", report.imagegenSkill.path ?? "not found"));
   lines.push("");
@@ -388,9 +436,15 @@ async function handleGenerate(argv) {
     process.exitCode = 1;
     return;
   }
+  const headless = resolveHeadlessMode(cwd);
+  if (!headless.ok) {
+    console.error(`Error: no supported headless mode for \`codex exec\` (${headless.detail}). Run /codex-image:status for details.`);
+    process.exitCode = 1;
+    return;
+  }
   const codexArgs = [
     "exec",
-    "--full-auto",
+    ...headless.args,
     "--skip-git-repo-check",
   ];
   for (const imagePath of referenceImagePaths) {
@@ -420,9 +474,15 @@ async function handleEdit(argv) {
     process.exitCode = 1;
     return;
   }
+  const headless = resolveHeadlessMode(cwd);
+  if (!headless.ok) {
+    console.error(`Error: no supported headless mode for \`codex exec\` (${headless.detail}). Run /codex-image:status for details.`);
+    process.exitCode = 1;
+    return;
+  }
   const codexArgs = [
     "exec",
-    "--full-auto",
+    ...headless.args,
     "--skip-git-repo-check",
     "--image",
     inputPath,
@@ -506,6 +566,7 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
 
 export {
   buildEditInstruction,
+  detectHeadlessMode,
   buildGenerateInstruction,
   buildStatusReport,
   resolveCodex,

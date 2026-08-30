@@ -69,7 +69,7 @@ User      Claude Code      Bash (SKILL.md)     Node script        Codex CLI     
 The actual `codex` invocation:
 
 ```
-codex exec --full-auto --skip-git-repo-check [--image <abs-reference>...] -C <cwd> -- "<minimal instruction>
+codex exec <headless-mode> --skip-git-repo-check [--image <abs-reference>...] -C <cwd> -- "<minimal instruction>
 
 User request:
 
@@ -79,14 +79,14 @@ User request:
 for `generate`, and:
 
 ```
-codex exec --full-auto --skip-git-repo-check --image <abs-input> -C <cwd> -- "<minimal instruction>
+codex exec <headless-mode> --skip-git-repo-check --image <abs-input> -C <cwd> -- "<minimal instruction>
 
 User edit request:
 
 <raw edit request>"
 ```
 
-for `edit`, both with `stdio.in = "ignore"` (equivalent to `< /dev/null`).
+for `edit`, both with `stdio.in = "ignore"` (equivalent to `< /dev/null`). `<headless-mode>` is `--full-auto` or `-s workspace-write`, resolved by probing the installed CLI — see "Headless mode is feature-detected" below.
 
 The minimal instruction (about 6 lines, in `scripts/codex-image.mjs`):
 
@@ -109,7 +109,7 @@ For `/codex-image:status`, the Node script does a multi-call diagnostic that is 
 
 - `codex --version` — semver compare against `0.142.0`
 - `codex login status` — parse "Logged in" line
-- `codex exec --full-auto --help` — verify the documented headless mode is still accepted and `--image` attachment support exists
+- `codex exec --full-auto --help`, falling back to `codex exec -s workspace-write --help` — resolve the headless mode the installed CLI accepts, and read `--image` attachment support out of whichever call exited 0
 - File check on `~/.codex/skills/.system/imagegen/SKILL.md`
 
 ## Load-bearing edge cases
@@ -150,9 +150,15 @@ The flags are repeatable up to 5 references — the built-in image tool caps ref
 
 This keeps reference images mechanical while preserving the "natural language owns output control" rule: sizes, counts, quality, output paths, transparency, and creative direction still live inside the remaining prompt and are interpreted by `imagegen`.
 
-### `--full-auto` is sufficient
+### Headless mode is feature-detected
 
-Local validation on Codex CLI 0.142.0 showed the documented `--full-auto` mode runs the `imagegen` flow, copies the selected output from `~/.codex/generated_images/...`, and resizes the final artifact. Do not use the undocumented `--yolo` unless a future Codex regression proves `--full-auto` insufficient.
+Local validation on Codex CLI 0.142.0 showed the documented `--full-auto` mode runs the `imagegen` flow, copies the selected output from `~/.codex/generated_images/...`, and resizes the final artifact. Codex CLI 0.151.0 then removed the alias from `codex exec` — `error: unexpected argument '--full-auto' found`, exit 2 — which broke every dispatch and the `status` probe with it.
+
+`detectHeadlessMode` in `scripts/codex-image.mjs` therefore resolves the flag once per process instead of hardcoding it: run `codex exec --full-auto --help` and keep `--full-auto` if it exits 0, otherwise fall back to `-s workspace-write`, the sandbox policy `--full-auto` implied and the spelling 0.151.0 accepts. Probing beats a version comparison here — the removal is a flag-surface change, the help exit code answers it directly, and the plugin does not have to track which exact release dropped what.
+
+`status`, `generate`, and `edit` all read the same resolved value, so the diagnostic can never disagree with what is dispatched. Do not use the undocumented `--yolo`; `-s danger-full-access` is likewise out of scope, since image generation only needs to write into the workspace.
+
+The `--image` check hangs off the same probe: it greps the help text of the invocation that exited 0. Grepping a rejected invocation's output — six lines of clap usage, no option list — reported `--image` as missing on CLIs that support it, sending users to an irrelevant "upgrade Codex" next step.
 
 ### Git repository is optional
 
@@ -210,7 +216,7 @@ The current architecture is the synthesis: a thin Node wrapper does only the thi
 
 - **Stay thin.** The Node wrapper does arg splitting and codex spawning. Nothing else. Image-generation intelligence lives in `imagegen`.
 - **No in-bash parsing in SKILL.md.** Single-line `node script <cmd> "$ARGUMENTS"` only. Anything more complex must live in the Node script.
-- **Contract changes propagate here first.** If Codex CLI changes the headless invocation contract (`< /dev/null`, `--full-auto`, `--skip-git-repo-check`, `--image`, the `image_gen.imagegen` extension tool and its `referenced_image_paths` input, `~/.codex/generated_images/` path, `imagegen` skill id, `codex login status`), update `scripts/codex-image.mjs` and the **Load-bearing edge cases** section above in the same PR.
+- **Contract changes propagate here first.** If Codex CLI changes the headless invocation contract (`< /dev/null`, the headless sandbox flags in `HEADLESS_MODE_CANDIDATES`, `--skip-git-repo-check`, `--image`, the `image_gen.imagegen` extension tool and its `referenced_image_paths` input, `~/.codex/generated_images/` path, `imagegen` skill id, `codex login status`), update `scripts/codex-image.mjs` and the **Load-bearing edge cases** section above in the same PR.
 - **Scope is image generation.** A new Codex built-in tool (`web_search`, `browser`) deserves a separate plugin.
 
 ## Relationship to openai/codex-plugin-cc

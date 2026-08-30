@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Codex CLI 0.151.0 removed the `--full-auto` alias from `codex exec`, which broke every `generate` / `edit` dispatch (`error: unexpected argument '--full-auto' found`) and made `/codex-image:status` report `Ready: no`. The headless mode is now feature-detected once per process — `--full-auto` where the installed CLI still accepts it, `-s workspace-write` otherwise — and `status`, `generate`, and `edit` share the resolved flag. ([#5](https://github.com/KingGyuSuh/codex-image-in-cc/issues/5))
+- `/codex-image:status` no longer reports a spurious `FAIL Image attachment` when the headless probe fails. The `--image` check read the output of the rejected `codex exec --full-auto --help` call, which contains no option list; it now reads the help output of the invocation that exited 0.
+
+### Changed
+
+- `status --json` reports the resolved headless mode under a new `headlessExec` key (`{ ok, mode, detail }`). The old `fullAuto` key is kept as a deprecated alias pointing at the same object.
+
 ## [0.2.0] - 2026-07-10
 
 ### Added

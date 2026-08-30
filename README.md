@@ -6,7 +6,7 @@
 
 Claude Code plugin that exposes Codex CLI's built-in `imagegen` skill as `/codex-image:*` user-invoked plugin skills.
 
-The plugin does not implement image generation itself. Each plugin skill dispatches to `codex exec --full-auto` and lets Codex's `imagegen` skill drive the built-in `image_gen` tool, use attached reference/edit images, save the final artifact, and print a `SAVED: <path>` line for each output.
+The plugin does not implement image generation itself. Each plugin skill dispatches to a headless `codex exec` turn (`--full-auto`, or `-s workspace-write` on Codex CLI releases that dropped the alias) and lets Codex's `imagegen` skill drive the built-in `image_gen` tool, use attached reference/edit images, save the final artifact, and print a `SAVED: <path>` line for each output.
 
 ## Requirements
 

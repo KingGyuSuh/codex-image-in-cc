@@ -5,11 +5,40 @@ import {
   buildEditInstruction,
   buildGenerateInstruction,
   compareSemver,
+  detectHeadlessMode,
   parseGenerateArguments,
   resolveCodex,
   splitFirstToken,
   timestampForFile
 } from "../scripts/codex-image.mjs";
+
+const EXEC_HELP = [
+  "Run Codex non-interactively",
+  "",
+  "  -i, --image <FILE>...",
+  "          Optional image(s) to attach to the initial prompt",
+  "",
+  "  -s, --sandbox <SANDBOX_MODE>",
+  "          [possible values: read-only, workspace-write, danger-full-access]"
+].join("\n");
+
+// clap's rejection of an unknown flag: exit code 2, six-line usage blurb, no option list.
+const FULL_AUTO_REJECTED = {
+  available: true,
+  status: 2,
+  stdout: "",
+  stderr: "error: unexpected argument '--full-auto' found\n\nUsage: codex exec [OPTIONS] [PROMPT]",
+  error: null
+};
+
+function fakeRunner(responses) {
+  const calls = [];
+  const run = (command, args) => {
+    calls.push(args);
+    return responses(args);
+  };
+  return { run, calls };
+}
 
 test("compareSemver handles prefixed command output", () => {
   assert.equal(compareSemver("codex-cli 0.124.0", "0.124.0"), 0);
@@ -117,4 +146,65 @@ test("buildEditInstruction names the edit target's absolute path", () => {
 
 test("resolveCodex uses the bare codex command outside Windows", { skip: process.platform === "win32" }, () => {
   assert.deepEqual(resolveCodex(), { command: "codex", prefix: [] });
+});
+
+test("detectHeadlessMode keeps --full-auto where the installed Codex still accepts it", () => {
+  const { run, calls } = fakeRunner(() => ({
+    available: true,
+    status: 0,
+    stdout: EXEC_HELP,
+    stderr: "",
+    error: null
+  }));
+  const mode = detectHeadlessMode("/tmp", run);
+  assert.equal(mode.ok, true);
+  assert.deepEqual(mode.args, ["--full-auto"]);
+  assert.equal(mode.label, "--full-auto");
+  assert.equal(calls.length, 1, "must not probe the fallback once --full-auto is accepted");
+});
+
+test("detectHeadlessMode falls back to -s workspace-write when --full-auto is rejected", () => {
+  const { run, calls } = fakeRunner((args) =>
+    args.includes("--full-auto")
+      ? FULL_AUTO_REJECTED
+      : { available: true, status: 0, stdout: EXEC_HELP, stderr: "", error: null }
+  );
+  const mode = detectHeadlessMode("/tmp", run);
+  assert.equal(mode.ok, true);
+  assert.deepEqual(mode.args, ["-s", "workspace-write"]);
+  assert.deepEqual(calls[1], ["exec", "-s", "workspace-write", "--help"]);
+});
+
+test("detectHeadlessMode surfaces --image support from the help call that succeeded", () => {
+  const { run } = fakeRunner((args) =>
+    args.includes("--full-auto")
+      ? FULL_AUTO_REJECTED
+      : { available: true, status: 0, stdout: EXEC_HELP, stderr: "", error: null }
+  );
+  // Regression: the old probe grepped the rejected --full-auto output, which has no
+  // option list, and reported "--image not found" on a CLI that does support it.
+  assert.match(detectHeadlessMode("/tmp", run).helpText, /-i, --image <FILE>/);
+});
+
+test("detectHeadlessMode reports failure when no candidate is accepted", () => {
+  const { run, calls } = fakeRunner(() => FULL_AUTO_REJECTED);
+  const mode = detectHeadlessMode("/tmp", run);
+  assert.equal(mode.ok, false);
+  assert.equal(mode.args, null);
+  assert.equal(calls.length, 2);
+  assert.match(mode.detail, /unexpected argument/);
+});
+
+test("detectHeadlessMode stops probing when the Codex binary is missing", () => {
+  const { run, calls } = fakeRunner(() => ({
+    available: false,
+    status: null,
+    stdout: "",
+    stderr: "",
+    error: new Error("spawn codex ENOENT")
+  }));
+  const mode = detectHeadlessMode("/tmp", run);
+  assert.equal(mode.ok, false);
+  assert.equal(calls.length, 1);
+  assert.match(mode.detail, /not found/);
 });
