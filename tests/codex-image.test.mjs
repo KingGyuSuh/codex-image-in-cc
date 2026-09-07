@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  AUTO_APPROVAL_FLAGS,
   buildEditInstruction,
   buildGenerateInstruction,
   compareSemver,
   parseGenerateArguments,
+  resolveAutoApproval,
   resolveCodex,
   splitFirstToken,
   timestampForFile
@@ -117,4 +119,36 @@ test("buildEditInstruction names the edit target's absolute path", () => {
 
 test("resolveCodex uses the bare codex command outside Windows", { skip: process.platform === "win32" }, () => {
   assert.deepEqual(resolveCodex(), { command: "codex", prefix: [] });
+});
+
+test("resolveAutoApproval prefers --full-auto when the CLI still accepts it", () => {
+  const seen = [];
+  const runner = (_command, args) => {
+    seen.push(args.at(-2));
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  const result = resolveAutoApproval(".", runner);
+  assert.equal(result.flag, "--full-auto");
+  assert.deepEqual(seen, ["--full-auto"]);
+});
+
+test("resolveAutoApproval falls back to --approve-for-me on Codex 0.153+", () => {
+  const runner = (_command, args) =>
+    args.includes("--full-auto")
+      ? { status: 2, stdout: "", stderr: "error: unexpected argument '--full-auto' found" }
+      : { status: 0, stdout: "", stderr: "" };
+  const result = resolveAutoApproval(".", runner);
+  assert.equal(result.flag, "--approve-for-me");
+  assert.match(result.detail, /--approve-for-me` accepted/);
+});
+
+test("resolveAutoApproval reports no flag when the CLI accepts none", () => {
+  const runner = () => ({ status: 2, stdout: "", stderr: "error: unexpected argument found" });
+  const result = resolveAutoApproval(".", runner);
+  assert.equal(result.flag, null);
+  assert.equal(result.detail, "error: unexpected argument found");
+});
+
+test("AUTO_APPROVAL_FLAGS is probed newest-compatible-first", () => {
+  assert.deepEqual(AUTO_APPROVAL_FLAGS, ["--full-auto", "--approve-for-me"]);
 });

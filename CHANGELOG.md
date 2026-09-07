@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Every skill failed on Codex CLI 0.153+ with `error: unexpected argument '--full-auto' found`. That release removed `--full-auto` from `codex exec`; the plugin now probes `--full-auto` then `--approve-for-me` and dispatches with whichever the installed CLI accepts, so 0.142–0.152 and 0.153+ both work from one build.
+- `/codex-image:status` no longer reports `--image` as missing whenever the auto-approval probe fails. The image-attachment check now runs its own `codex exec --help` instead of reusing help text that a rejected flag never produced.
+
+### Changed
+
+- `/codex-image:status --json` renames the `fullAuto` key to `autoApproval` and adds a `flag` field naming the flag in use.
+
 ## [0.2.0] - 2026-07-10
 
 ### Added

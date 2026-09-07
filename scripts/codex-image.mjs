@@ -9,6 +9,11 @@ import { pathToFileURL } from "node:url";
 
 const MIN_NODE_VERSION = "18.18.0";
 const MIN_CODEX_VERSION = "0.142.0";
+// Headless auto-approval flag for `codex exec`. `--full-auto` was the documented
+// alias through 0.14x and was removed in Codex CLI 0.153.x, where `--approve-for-me`
+// (workspace-write sandbox + automatic approval) took its place. Probed in this order
+// at dispatch time so one plugin build works on both sides of that break.
+const AUTO_APPROVAL_FLAGS = ["--full-auto", "--approve-for-me"];
 // Contract cap of the Codex built-in image tool: at most 5 reference images per
 // request (schema-enforced via `referenced_image_paths` since codex 0.144).
 const MAX_REFERENCE_IMAGES = 5;
@@ -124,6 +129,25 @@ function statusLine(ok, label, detail) {
   return `${ok ? "OK" : "FAIL"} ${label}: ${detail}`;
 }
 
+// Returns the first auto-approval flag the installed Codex CLI accepts, or a null
+// flag when none is. `codex exec <flag> --help` exits non-zero on an unknown flag,
+// which is the cheapest probe that does not start an agent turn. Called once per
+// process, so it deliberately does not memoize.
+function resolveAutoApproval(cwd, runner = runSync) {
+  let last = null;
+  for (const flag of AUTO_APPROVAL_FLAGS) {
+    const result = runner(CODEX.command, [...CODEX.prefix, "exec", flag, "--help"], { cwd });
+    last = result;
+    if (result.status === 0) {
+      return { flag, detail: `\`codex exec ${flag}\` accepted` };
+    }
+  }
+  return {
+    flag: null,
+    detail: (last?.stderr || last?.stdout || "not checked").trim()
+  };
+}
+
 function findImagegenSkill() {
   const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
   const candidate = path.join(codexHome, "skills", ".system", "imagegen", "SKILL.md");
@@ -145,15 +169,20 @@ function buildStatusReport(options = {}) {
   const loginText = loginStatus ? (loginStatus.stdout || loginStatus.stderr).trim() : "Codex unavailable";
   const loginOk = Boolean(loginStatus?.status === 0 && /logged in/i.test(loginText));
 
-  const fullAutoStatus = codexOk ? runSync(CODEX.command, [...CODEX.prefix, "exec", "--full-auto", "--help"], { cwd }) : null;
-  const fullAutoOk = Boolean(fullAutoStatus?.status === 0);
-  const execHelpText = `${fullAutoStatus?.stdout ?? ""}\n${fullAutoStatus?.stderr ?? ""}`;
-  const imageAttachmentOk = Boolean(fullAutoOk && /(^|\s)(-i,\s*)?--image(\s|=|<|$)/.test(execHelpText));
+  const autoApproval = codexOk ? resolveAutoApproval(cwd) : null;
+  const autoApprovalOk = Boolean(autoApproval?.flag);
+
+  // Probed independently of the auto-approval flag: a rejected flag makes Codex print
+  // a short usage error instead of the full help, which used to report `--image` as
+  // missing whenever the auto-approval probe failed.
+  const execHelp = codexOk ? runSync(CODEX.command, [...CODEX.prefix, "exec", "--help"], { cwd }) : null;
+  const execHelpText = `${execHelp?.stdout ?? ""}\n${execHelp?.stderr ?? ""}`;
+  const imageAttachmentOk = /(^|\s)(-i,\s*)?--image(\s|=|<|$)/.test(execHelpText);
 
   const imagegenSkillPath = findImagegenSkill();
   const imagegenOk = Boolean(imagegenSkillPath);
 
-  const ready = nodeOk && codexOk && loginOk && fullAutoOk && imageAttachmentOk && imagegenOk;
+  const ready = nodeOk && codexOk && loginOk && autoApprovalOk && imageAttachmentOk && imagegenOk;
   const nextSteps = [];
   if (!nodeOk) {
     nextSteps.push(`Install Node.js ${MIN_NODE_VERSION} or newer.`);
@@ -166,10 +195,10 @@ function buildStatusReport(options = {}) {
   if (codexOk && !loginOk) {
     nextSteps.push("Run `codex login`.");
   }
-  if (codexOk && !fullAutoOk) {
-    nextSteps.push("This plugin depends on `codex exec --full-auto`; verify the installed Codex CLI still supports that documented alias.");
+  if (codexOk && !autoApprovalOk) {
+    nextSteps.push(`This plugin needs one of \`codex exec ${AUTO_APPROVAL_FLAGS.join("` or `")}\`; the installed Codex CLI accepts neither.`);
   }
-  if (codexOk && fullAutoOk && !imageAttachmentOk) {
+  if (codexOk && !imageAttachmentOk) {
     nextSteps.push("This plugin depends on `codex exec --image` for edit and reference-image input. Upgrade Codex CLI.");
   }
   if (!imagegenOk) {
@@ -187,11 +216,10 @@ function buildStatusReport(options = {}) {
       minimum: MIN_CODEX_VERSION
     },
     login: { ok: loginOk, detail: loginText || "not logged in" },
-    fullAuto: {
-      ok: fullAutoOk,
-      detail: fullAutoOk
-        ? "`codex exec --full-auto` accepted"
-        : (fullAutoStatus?.stderr || fullAutoStatus?.stdout || "not checked").trim()
+    autoApproval: {
+      ok: autoApprovalOk,
+      flag: autoApproval?.flag ?? null,
+      detail: autoApproval?.detail ?? "not checked"
     },
     imageAttachment: {
       ok: imageAttachmentOk,
@@ -209,7 +237,7 @@ function renderStatusReport(report) {
   lines.push(statusLine(report.node.ok, "Node", `v${report.node.version} (minimum ${report.node.minimum})`));
   lines.push(statusLine(report.codex.ok, "Codex", `${report.codex.version} (minimum ${report.codex.minimum})`));
   lines.push(statusLine(report.login.ok, "Codex login", report.login.detail));
-  lines.push(statusLine(report.fullAuto.ok, "Headless exec", report.fullAuto.detail));
+  lines.push(statusLine(report.autoApproval.ok, "Headless exec", report.autoApproval.detail));
   lines.push(statusLine(report.imageAttachment.ok, "Image attachment", report.imageAttachment.detail));
   lines.push(statusLine(report.imagegenSkill.ok, "imagegen skill", report.imagegenSkill.path ?? "not found"));
   lines.push("");
@@ -388,9 +416,15 @@ async function handleGenerate(argv) {
     process.exitCode = 1;
     return;
   }
+  const autoApproval = resolveAutoApproval(cwd);
+  if (!autoApproval.flag) {
+    console.error(`Error: the installed Codex CLI accepts neither \`codex exec ${AUTO_APPROVAL_FLAGS.join("` nor `")}\`. Run /codex-image:status.`);
+    process.exitCode = 1;
+    return;
+  }
   const codexArgs = [
     "exec",
-    "--full-auto",
+    autoApproval.flag,
     "--skip-git-repo-check",
   ];
   for (const imagePath of referenceImagePaths) {
@@ -420,9 +454,15 @@ async function handleEdit(argv) {
     process.exitCode = 1;
     return;
   }
+  const autoApproval = resolveAutoApproval(cwd);
+  if (!autoApproval.flag) {
+    console.error(`Error: the installed Codex CLI accepts neither \`codex exec ${AUTO_APPROVAL_FLAGS.join("` nor `")}\`. Run /codex-image:status.`);
+    process.exitCode = 1;
+    return;
+  }
   const codexArgs = [
     "exec",
-    "--full-auto",
+    autoApproval.flag,
     "--skip-git-repo-check",
     "--image",
     inputPath,
@@ -505,6 +545,7 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
 }
 
 export {
+  AUTO_APPROVAL_FLAGS,
   buildEditInstruction,
   buildGenerateInstruction,
   buildStatusReport,
@@ -513,6 +554,7 @@ export {
   parseSemver,
   parseGenerateArguments,
   renderStatusReport,
+  resolveAutoApproval,
   splitFirstToken,
   timestampForFile
 };

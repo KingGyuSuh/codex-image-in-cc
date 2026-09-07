@@ -69,7 +69,7 @@ User      Claude Code      Bash (SKILL.md)     Node script        Codex CLI     
 The actual `codex` invocation:
 
 ```
-codex exec --full-auto --skip-git-repo-check [--image <abs-reference>...] -C <cwd> -- "<minimal instruction>
+codex exec <auto-approval-flag> --skip-git-repo-check [--image <abs-reference>...] -C <cwd> -- "<minimal instruction>
 
 User request:
 
@@ -79,7 +79,7 @@ User request:
 for `generate`, and:
 
 ```
-codex exec --full-auto --skip-git-repo-check --image <abs-input> -C <cwd> -- "<minimal instruction>
+codex exec <auto-approval-flag> --skip-git-repo-check --image <abs-input> -C <cwd> -- "<minimal instruction>
 
 User edit request:
 
@@ -109,7 +109,8 @@ For `/codex-image:status`, the Node script does a multi-call diagnostic that is 
 
 - `codex --version` — semver compare against `0.142.0`
 - `codex login status` — parse "Logged in" line
-- `codex exec --full-auto --help` — verify the documented headless mode is still accepted and `--image` attachment support exists
+- `codex exec --full-auto --help`, then `codex exec --approve-for-me --help` — find the headless auto-approval flag this CLI accepts
+- `codex exec --help` — verify `--image` attachment support exists
 - File check on `~/.codex/skills/.system/imagegen/SKILL.md`
 
 ## Load-bearing edge cases
@@ -150,9 +151,13 @@ The flags are repeatable up to 5 references — the built-in image tool caps ref
 
 This keeps reference images mechanical while preserving the "natural language owns output control" rule: sizes, counts, quality, output paths, transparency, and creative direction still live inside the remaining prompt and are interpreted by `imagegen`.
 
-### `--full-auto` is sufficient
+### The headless auto-approval flag is version-dependent
 
-Local validation on Codex CLI 0.142.0 showed the documented `--full-auto` mode runs the `imagegen` flow, copies the selected output from `~/.codex/generated_images/...`, and resizes the final artifact. Do not use the undocumented `--yolo` unless a future Codex regression proves `--full-auto` insufficient.
+Local validation on Codex CLI 0.142.0 showed the documented `--full-auto` mode runs the `imagegen` flow, copies the selected output from `~/.codex/generated_images/...`, and resizes the final artifact. **Codex CLI 0.153.x removed `--full-auto`** (and `--ask-for-approval`) from `codex exec`; `--approve-for-me` replaced it with the same effect — workspace-write sandbox plus automatic approval.
+
+`resolveAutoApproval()` therefore probes `AUTO_APPROVAL_FLAGS` in order (`--full-auto`, then `--approve-for-me`) with `codex exec <flag> --help`, which exits non-zero on an unknown flag without starting an agent turn, and dispatches with the first one accepted. One probe runs per process invocation, so the resolver deliberately does not memoize. Do not use the undocumented `--yolo`.
+
+Because a rejected flag makes Codex print a short usage error instead of the full help, the `--image` support check in `/codex-image:status` runs its own plain `codex exec --help` rather than reusing the probe output — otherwise an unsupported auto-approval flag makes `--image` look missing too.
 
 ### Git repository is optional
 
@@ -210,7 +215,7 @@ The current architecture is the synthesis: a thin Node wrapper does only the thi
 
 - **Stay thin.** The Node wrapper does arg splitting and codex spawning. Nothing else. Image-generation intelligence lives in `imagegen`.
 - **No in-bash parsing in SKILL.md.** Single-line `node script <cmd> "$ARGUMENTS"` only. Anything more complex must live in the Node script.
-- **Contract changes propagate here first.** If Codex CLI changes the headless invocation contract (`< /dev/null`, `--full-auto`, `--skip-git-repo-check`, `--image`, the `image_gen.imagegen` extension tool and its `referenced_image_paths` input, `~/.codex/generated_images/` path, `imagegen` skill id, `codex login status`), update `scripts/codex-image.mjs` and the **Load-bearing edge cases** section above in the same PR.
+- **Contract changes propagate here first.** If Codex CLI changes the headless invocation contract (`< /dev/null`, the auto-approval flag in `AUTO_APPROVAL_FLAGS`, `--skip-git-repo-check`, `--image`, the `image_gen.imagegen` extension tool and its `referenced_image_paths` input, `~/.codex/generated_images/` path, `imagegen` skill id, `codex login status`), update `scripts/codex-image.mjs` and the **Load-bearing edge cases** section above in the same PR.
 - **Scope is image generation.** A new Codex built-in tool (`web_search`, `browser`) deserves a separate plugin.
 
 ## Relationship to openai/codex-plugin-cc
