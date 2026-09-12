@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-12
+
+### Added
+
+- Image generation now selects a stronger **orchestrator model and reasoning effort** when the account has one. The wrapper probes `codex debug models` (bounded by a 15s timeout — a stalled probe counts as an unavailable catalog) and passes `-m` / `-c model_reasoning_effort` for the first available rung of a preference ladder (`gpt-5.6-luna` high → `gpt-5.6-terra` medium → `gpt-5.6-sol` high → `gpt-5.6-sol` low). Accounts without those models (e.g. ChatGPT Free) or an offline probe transparently fall back to the Codex config default, so generation never regresses. If the backend rejects a ladder-selected model at turn start (e.g. a custom `model_provider` that does not serve official slugs the catalog still lists), the wrapper retries once without model flags — the rejection happens before any image tokens are spent. A streaming stderr monitor skips the echoed instruction, tracks a sticky "turn started" flag over the whole stream (a bare `codex` / `exec` event line, ANSI stripped), and classifies only codex's own `ERROR:` record, so an echoed prompt or tool output that mentions "unknown model" can neither cause nor suppress the fallback, and a turn that already produced an agent message or tool call is never retried — an unrelated failure never becomes a second billed turn. Override with `CODEX_IMAGE_MODEL` + `CODEX_IMAGE_EFFORT` (both required, or the wrapper errors); a forced pair never falls back. `/codex-image:status` now reports the resolved orchestrator.
+
 ## [0.2.1] - 2026-09-12
 
 ### Fixed

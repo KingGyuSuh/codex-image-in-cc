@@ -69,7 +69,7 @@ User      Claude Code      Bash (SKILL.md)     Node script        Codex CLI     
 The actual `codex` invocation:
 
 ```
-codex exec --sandbox workspace-write -c approval_policy="never" --skip-git-repo-check [--image <abs-reference>...] -C <cwd> -- "<minimal instruction>
+codex exec --sandbox workspace-write -c approval_policy="never" --skip-git-repo-check [-m <model> -c model_reasoning_effort=<effort>] [--image <abs-reference>...] -C <cwd> -- "<minimal instruction>
 
 User request:
 
@@ -79,7 +79,7 @@ User request:
 for `generate`, and:
 
 ```
-codex exec --sandbox workspace-write -c approval_policy="never" --skip-git-repo-check --image <abs-input> -C <cwd> -- "<minimal instruction>
+codex exec --sandbox workspace-write -c approval_policy="never" --skip-git-repo-check [-m <model> -c model_reasoning_effort=<effort>] --image <abs-input> -C <cwd> -- "<minimal instruction>
 
 User edit request:
 
@@ -112,6 +112,7 @@ For `/codex-image:status`, the Node script does a multi-call diagnostic that is 
 - `codex exec --sandbox workspace-write --help` — verify the headless sandbox mode the wrapper dispatches with is still accepted
 - `codex exec --help` — verify `--image` attachment support exists (probed separately, so a rejected headless flag cannot mask it)
 - File check on `~/.codex/skills/.system/imagegen/SKILL.md`
+- `codex debug models` — resolve the image orchestrator model/effort from the account's live catalog (see "Image orchestrator model ladder"); a failed probe degrades to the codex default and is not a readiness failure
 
 ## Load-bearing edge cases
 
@@ -190,6 +191,20 @@ For generate, `--image` is an attachment mechanism, not a request to edit those 
 
 The conditioning mechanism changed in Codex CLI 0.144.0: image generation moved to an extension-backed tool (`image_gen.imagegen`) whose image inputs are local absolute paths the Codex-side model passes itself (`referenced_image_paths`, max 5, also used for edit targets). Attached turn images are no longer implicitly fed to the image tool. The wrapper therefore lists each reference's (and the edit target's) absolute path in the instruction text so the model can pass them to the tool, while keeping the `codex exec --image` attachments so the model can see the pixels for prompt-writing and validation — and so the 0.142–0.143 built-in tool path keeps working. The wrapper itself never calls the image tool and never passes `referenced_image_paths`; the Codex-side `imagegen` skill owns that decision.
 
+### Image orchestrator model ladder
+
+codex image generation is an agent turn (the "orchestrator") that decides to call the built-in image tool, interprets the prompt, conditions the reference pixels, and holds the requested aspect. The image pixels come from the image tool (gpt-image) regardless, but a stronger orchestrator model/effort makes that turn more reliable. Hardcoding one model would break accounts that cannot access it — notably ChatGPT Free — so the wrapper selects from the account's live catalog instead:
+
+1. Probe `codex debug models`, which renders the account's model catalog as JSON. The wrapper keeps only `models[]` with `visibility: "list"` (account-selectable) and records each model's `supported_reasoning_levels[].effort`.
+2. Walk `CODEX_IMAGE_ORCHESTRATOR_LADDER` — `gpt-5.6-luna` high → `gpt-5.6-terra` medium → `gpt-5.6-sol` high → `gpt-5.6-sol` low — and pick the first rung whose model is in the catalog and whose effort that model supports.
+3. Pass the pick as `-m <model> -c model_reasoning_effort="<effort>"`. The `-c` value is parsed as TOML, so the effort string is JSON-quoted.
+
+If the probe fails (codex missing, not logged in, offline) or no rung matches (e.g. a Free account with none of those models), the wrapper adds no `-m`/`-c` flags and codex uses its own config default — identical to the pre-ladder behavior, so image generation never regresses. The probe is bounded by a 15-second timeout: `codex debug models` runs synchronously before every generate/edit dispatch, and a stalled probe (bad network/proxy, hung catalog refresh) must count as an unavailable catalog rather than block the command from ever reaching the image turn.
+
+The ladder pick is also best-effort at spawn time, not just at probe time. The catalog can list a model the actual backend refuses — the canonical case is a custom/API-key `model_provider` that does not serve official slugs while the bundled catalog remains visible. Such a rejection kills the `codex exec` turn at startup (verified on 0.144.5 and 0.154.0: HTTP 400 `"The 'X' model is not supported…"` on stderr, empty stdout, no image tokens spent). When a **ladder-selected** orchestrator fails that way — non-zero exit, a model/effort-rejection signature in codex's `ERROR:` record (`isOrchestratorRejection`), and no `codex` / `exec` event line before it (`turnHadStarted`) — the wrapper retries once with no `-m`/`-c`, landing on the codex config default that worked before the ladder existed. Unrelated failures (quota, auth, transport) do not match the signature and are not retried, so a real image-turn failure is never double-billed. The classification looks only at codex's own stderr, via a streaming monitor (`createStderrMonitor`) fed as chunks arrive rather than a post-hoc scan of a bounded tail. `codex exec` echoes the full instruction under a `user` heading and later prints agent messages and tool output there too, so the monitor skips the echo by matching the exact text the wrapper sent (prompt lines can then neither masquerade as events nor be mistaken for an error record), tracks a sticky `started` flag over the entire remaining stream — a bare `codex` (agent message) or `exec` (tool call) line, ANSI stripped, since codex colours stderr under `FORCE_COLOR` even when piped — so that however much a tool printed the evidence is never lost to tail truncation, and keeps a bounded tail of codex's own output for the error record (everything from the first `ERROR:` line to the end, because a pretty-printed JSON rejection from a custom provider spans several lines). If the echo never matches (a codex version that stops echoing verbatim), the text is classified as codex's own once a size limit is hit or the process ends — the conservative direction, since prompt lines can then only suppress a retry. `shouldRetryWithoutOrchestrator` is the pure decision over that result: not started, and a rejection signature in the record.
+
+Setting both `CODEX_IMAGE_MODEL` and `CODEX_IMAGE_EFFORT` forces a specific pair and skips the probe entirely; setting only one is a hard error (an override must be explicit on both axes), and a forced pair never falls back — the user asserted it, so its rejection must surface as an error instead of a silent downgrade. `/codex-image:status` reports the resolved orchestrator and only fails readiness on an inconsistent override, never on an unavailable ladder model.
+
 ### Windows codex spawning
 
 On Windows, npm installs `codex` as a `codex.cmd` shim. `spawn("codex", ...)` does not find it (`ENOENT`), and Node 20+ refuses to spawn `.cmd` files directly without `shell: true` (`EINVAL`, post-[CVE-2024-27980](https://nodejs.org/en/blog/vulnerability/april-2024-security-releases-2) hardening). `shell: true` is not an acceptable fix because user prompts contain quotes, ampersands, and non-ASCII text that cmd.exe would re-parse. The wrapper instead resolves the shim via `where.exe codex.cmd`, locates the real entry point at `<shim-dir>/node_modules/@openai/codex/bin/codex.js`, and spawns it with `process.execPath` (node.exe). If resolution fails it falls back to `codex.cmd`. macOS/Linux behavior is unchanged.
@@ -219,7 +234,7 @@ The current architecture is the synthesis: a thin Node wrapper does only the thi
 
 - **Stay thin.** The Node wrapper does arg splitting and codex spawning. Nothing else. Image-generation intelligence lives in `imagegen`.
 - **No in-bash parsing in SKILL.md.** Single-line `node script <cmd> "$ARGUMENTS"` only. Anything more complex must live in the Node script.
-- **Contract changes propagate here first.** If Codex CLI changes the headless invocation contract (`< /dev/null`, `--sandbox workspace-write -c approval_policy="never"`, `--skip-git-repo-check`, `--image`, the `image_gen.imagegen` extension tool and its `referenced_image_paths` input, `~/.codex/generated_images/` path, `imagegen` skill id, `codex login status`), update `scripts/codex-image.mjs` and the **Load-bearing edge cases** section above in the same PR.
+- **Contract changes propagate here first.** If Codex CLI changes the headless invocation contract (`< /dev/null`, `--sandbox workspace-write -c approval_policy="never"`, `--skip-git-repo-check`, `--image`, `-m` / `-c model_reasoning_effort`, the `codex debug models` catalog shape, the `image_gen.imagegen` extension tool and its `referenced_image_paths` input, `~/.codex/generated_images/` path, `imagegen` skill id, `codex login status`), update `scripts/codex-image.mjs` and the **Load-bearing edge cases** section above in the same PR.
 - **Scope is image generation.** A new Codex built-in tool (`web_search`, `browser`) deserves a separate plugin.
 
 ## Relationship to openai/codex-plugin-cc

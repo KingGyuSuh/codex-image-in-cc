@@ -53,6 +53,21 @@ For `/codex-image:generate`, leading `--ref <path>`, `--reference <path>`, or `-
 
 For `/codex-image:edit`, the first whitespace-separated token is the input image path. Quote it if the path contains spaces (e.g. `/codex-image:edit "my photo.png" tint blue`).
 
+## Image model
+
+Image generation runs as a Codex agent turn (the "orchestrator") that calls the built-in image tool. The plugin picks a stronger orchestrator model/effort when your account has one, without breaking accounts that don't: it reads your live model catalog via `codex debug models` and selects the first available rung of a preference ladder —
+
+`gpt-5.6-luna` high → `gpt-5.6-terra` medium → `gpt-5.6-sol` high → `gpt-5.6-sol` low
+
+If none of those are available to your account (for example on ChatGPT Free), or the probe fails, the plugin passes no model flag and Codex uses its own configured default — image generation still works. `/codex-image:status` shows which orchestrator was resolved.
+
+To force a specific model and effort, set **both** environment variables (setting only one is an error):
+
+```bash
+export CODEX_IMAGE_MODEL=gpt-5.6-terra
+export CODEX_IMAGE_EFFORT=high   # none|minimal|low|medium|high|xhigh|max|ultra
+```
+
 ## Development
 
 ```bash
