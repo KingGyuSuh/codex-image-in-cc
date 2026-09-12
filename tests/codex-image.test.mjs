@@ -300,40 +300,81 @@ test("isOrchestratorRejection reads codex's ERROR record, including multi-line J
   );
 });
 
-test("codexOwnStderr cuts the echoed instruction off, even when the tail starts inside it", async () => {
-  const { codexOwnStderr } = await import("../scripts/codex-image.mjs");
-  const instruction = "Use the imagegen skill.\n\nUser request:\n\ncodex\nexec\nA wordmark reading Unknown Model";
-  const full = `OpenAI Codex v0.154.0\n--------\nuser\n${instruction}\nERROR: boom\n`;
-  assert.equal(codexOwnStderr(full, instruction), "\nERROR: boom\n");
-  const truncated = `request:\n\ncodex\nexec\nA wordmark reading Unknown Model\nERROR: boom\n`;
-  assert.equal(codexOwnStderr(truncated, instruction), "ERROR: boom\n");
-  assert.equal(codexOwnStderr("ERROR: boom\n", instruction), "ERROR: boom\n");
+test("createStderrMonitor skips the echoed instruction across chunk boundaries and ignores prompt lines", async () => {
+  const { createStderrMonitor } = await import("../scripts/codex-image.mjs");
+  const instruction = "Use the imagegen skill.\n\nUser request:\n\ncodex\nexec\nA poster titled Unknown Model, save to /tmp/wordmark.png";
+  const monitor = createStderrMonitor(instruction);
+  const stream = `OpenAI Codex v0.154.0\n--------\nuser\n${instruction}\nERROR: boom\n`;
+  for (let i = 0; i < stream.length; i += 7) {
+    monitor.feed(stream.slice(i, i + 7));
+  }
+  const { started, tail } = monitor.result();
+  assert.equal(started, false, "the prompt's own codex/exec lines are not events");
+  assert.equal(tail, "\nERROR: boom\n");
 });
 
-test("shouldRetryWithoutOrchestrator fires only for a startup rejection in codex's own output", async () => {
-  const { shouldRetryWithoutOrchestrator, turnHadStarted } = await import("../scripts/codex-image.mjs");
+test("createStderrMonitor keeps turn-start evidence after the tail has rolled past it", async () => {
+  const { createStderrMonitor, shouldRetryWithoutOrchestrator } = await import("../scripts/codex-image.mjs");
+  const instruction = "Use the imagegen skill.\n\nUser request:\n\nA wordmark saved to /tmp/wordmark.png";
+  const monitor = createStderrMonitor(instruction);
+  monitor.feed(`OpenAI Codex v0.154.0\nuser\n${instruction}\n`);
+  // A real tool call whose command ends with the prompt's last line, then enough
+  // tool output to push everything out of the bounded tail, then a rejection-like error.
+  monitor.feed("codex\nRunning the skill.\nexec\n/bin/zsh -lc 'sips -z 512 512 /tmp/wordmark.png'\n succeeded in 0ms:\n");
+  monitor.feed(`${"x".repeat(20000)}\n`);
+  monitor.feed("ERROR: The 'gpt-5.6-luna' model is not supported\n");
+  const result = monitor.result();
+  assert.equal(result.started, true);
+  assert.ok(!result.tail.includes("exec\n"), "the tail has lost the marker; the flag must not");
+  assert.equal(shouldRetryWithoutOrchestrator(result), false);
+});
+
+test("createStderrMonitor recognises ANSI-styled event lines and a final unterminated line", async () => {
+  const { createStderrMonitor } = await import("../scripts/codex-image.mjs");
+  const instruction = "A tiny grey circle";
+  const styled = createStderrMonitor(instruction);
+  styled.feed(`user\n${instruction}\n\u001b[1mexec\u001b[0m\n/bin/zsh -lc 'ls'\n`);
+  assert.equal(styled.result().started, true);
+  const unterminated = createStderrMonitor(instruction);
+  unterminated.feed(`user\n${instruction}\ncodex`);
+  assert.equal(unterminated.result().started, true);
+});
+
+test("createStderrMonitor classifies conservatively when the echo never appears", async () => {
+  const { createStderrMonitor, shouldRetryWithoutOrchestrator } = await import("../scripts/codex-image.mjs");
+  // Failure before any echo (e.g. auth): classify what was printed.
+  const early = createStderrMonitor("some instruction");
+  early.feed("ERROR: The 'x' model is not supported\n");
+  assert.equal(shouldRetryWithoutOrchestrator(early.result()), true);
+  // Echo format changed and the turn ran: the event lines still count, so no retry.
+  const changed = createStderrMonitor("some instruction");
+  changed.feed("user\n(prompt rendered differently)\nexec\n/bin/zsh -lc 'ls'\nERROR: The 'x' model is not supported\n");
+  assert.equal(shouldRetryWithoutOrchestrator(changed.result()), false);
+});
+
+test("shouldRetryWithoutOrchestrator fires only for a startup rejection", async () => {
+  const { createStderrMonitor, shouldRetryWithoutOrchestrator } = await import("../scripts/codex-image.mjs");
   const rejection =
     `ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.6-luna' model is not supported when using Codex with a ChatGPT account."}}`;
-  const instruction = "Use the imagegen skill.\n\nUser request:\n\nA tiny grey circle";
-  const header = `OpenAI Codex v0.154.0\n--------\nmodel: gpt-5.6-luna\n--------\nuser\n${instruction}\n`;
-  // Startup rejection right after the echo: retry.
-  assert.equal(shouldRetryWithoutOrchestrator(`${header}${rejection}\n`, instruction), true);
-  // A prompt containing standalone "codex" / "exec" lines and rejection-like words
-  // is echoed before the real error; it must not suppress (or cause) the retry.
-  const trickyInstruction = "Use the imagegen skill.\n\nUser request:\n\ncodex\nexec\nA poster titled Unknown Model";
-  const trickyHeader = `OpenAI Codex v0.154.0\n--------\nuser\n${trickyInstruction}\n`;
-  assert.equal(shouldRetryWithoutOrchestrator(`${trickyHeader}${rejection}\n`, trickyInstruction), true);
+  const instruction = "Use the imagegen skill.\n\nUser request:\n\ncodex\nexec\nA poster titled Unknown Model";
+  const run = (afterEcho) => {
+    const monitor = createStderrMonitor(instruction);
+    monitor.feed(`OpenAI Codex v0.154.0\n--------\nmodel: gpt-5.6-luna\n--------\nuser\n${instruction}\n${afterEcho}`);
+    return monitor.result();
+  };
+  // Startup rejection right after the echo (which itself contains event-like and
+  // rejection-like lines): retry.
+  assert.equal(shouldRetryWithoutOrchestrator(run(`${rejection}\n`)), true);
+  // Unrelated failure at startup: no retry.
+  assert.equal(shouldRetryWithoutOrchestrator(run("ERROR: stream disconnected before completion\n")), false);
+  assert.equal(shouldRetryWithoutOrchestrator(run("ERROR: you've hit your usage limit\n")), false);
+  // Same rejection text after the turn produced a tool call: no retry.
   assert.equal(
-    shouldRetryWithoutOrchestrator(`${trickyHeader}ERROR: stream disconnected before completion\n`, trickyInstruction),
+    shouldRetryWithoutOrchestrator(run(`codex\nUsing the imagegen skill.\nexec\n/bin/zsh -lc 'sed -n 1,40p SKILL.md'\n succeeded in 0ms:\n...\n${rejection}\n`)),
     false
   );
-  // Same rejection text after the turn produced a tool call: the image tool may
-  // already have been billed, so no retry.
-  const started = `${header}codex\nUsing the imagegen skill.\nexec\n/bin/zsh -lc 'sed -n 1,40p SKILL.md'\n succeeded in 0ms:\n...\n${rejection}\n`;
-  assert.equal(turnHadStarted(started), true);
-  assert.equal(shouldRetryWithoutOrchestrator(started, instruction), false);
-  // Unrelated failure at startup: no retry.
-  assert.equal(shouldRetryWithoutOrchestrator(`${header}ERROR: you've hit your usage limit\n`, instruction), false);
+  // No monitor (stderr not captured): never retry.
+  assert.equal(shouldRetryWithoutOrchestrator(null), false);
 });
 
 test("isOrchestratorRejection ignores unrelated failures", async () => {

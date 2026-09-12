@@ -338,31 +338,6 @@ function stripAnsi(text) {
   return String(text ?? "").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
 }
 
-// `codex exec` echoes the full instruction to stderr under a `user` heading before
-// any event, and later prints agent messages and tool output there too. Cut the
-// echo off first so prompt text can never masquerade as a codex event or error line.
-// The captured tail is bounded, so it may start inside the echo; the echo still ends
-// with the instruction's last line, so cut at the first occurrence of that line.
-function codexOwnStderr(stderrTail, instruction) {
-  const text = stripAnsi(stderrTail);
-  const body = String(instruction ?? "");
-  if (!body) {
-    return text;
-  }
-  const whole = text.indexOf(body);
-  if (whole !== -1) {
-    return text.slice(whole + body.length);
-  }
-  const lastLine = body.trimEnd().split("\n").pop();
-  if (lastLine) {
-    const end = text.indexOf(`${lastLine}\n`);
-    if (end !== -1) {
-      return text.slice(end + lastLine.length + 1);
-    }
-  }
-  return text;
-}
-
 // The error record is everything from codex's first `ERROR:` line to the end of
 // the captured text: a pretty-printed JSON rejection (custom providers) spans
 // several lines, and codex exits right after printing it.
@@ -376,17 +351,79 @@ function isOrchestratorRejection(stderrText) {
 // bare `exec` line on stderr. Either means the turn got past startup — the image
 // tool may already have run and been billed — so a later failure is never retried,
 // whatever its error text says. A model rejection happens before either appears.
-const TURN_EVENT_LINE = /^(codex|exec)$/m;
+const TURN_EVENT_LINE = /^(codex|exec)\r?$/;
 
-function turnHadStarted(stderrText) {
-  return TURN_EVENT_LINE.test(stripAnsi(stderrText));
+// Bounded tail of codex's own stderr kept for the error record.
+const STDERR_TAIL_CHARS = 4000;
+
+// Streaming monitor for one codex exec attempt's stderr, fed raw chunks as they
+// arrive. `codex exec` echoes the full instruction under a `user` heading before any
+// event, and later prints agent messages and tool output to stderr too, so:
+// - the echo is skipped by matching the exact text the wrapper sent (prompt lines
+//   can then neither masquerade as events nor be mistaken for an error record);
+// - `started` is a sticky flag computed over the ENTIRE post-echo stream, so the
+//   bounded tail can never lose turn-start evidence, however much a tool printed;
+// - `tail` keeps the last STDERR_TAIL_CHARS of codex's own output for the record.
+// If the echo never matches (a codex version that no longer echoes verbatim), the
+// text is classified as codex's own once a size limit is hit or the process ends —
+// the conservative direction, since prompt lines can then only suppress a retry.
+function createStderrMonitor(instruction) {
+  const body = String(instruction ?? "");
+  let pending = body ? "" : null; // pre-echo accumulator; null once the echo is past
+  const pendingLimit = body.length + 65536;
+  let carry = "";
+  let started = false;
+  let tail = "";
+
+  function consumeOwn(text) {
+    tail = (tail + text).slice(-STDERR_TAIL_CHARS);
+    const lines = (carry + text).split("\n");
+    carry = lines.pop();
+    for (const line of lines) {
+      if (TURN_EVENT_LINE.test(stripAnsi(line))) {
+        started = true;
+      }
+    }
+  }
+
+  return {
+    feed(chunk) {
+      let text = String(chunk);
+      if (pending !== null) {
+        pending += text;
+        const at = pending.indexOf(body);
+        if (at !== -1) {
+          text = pending.slice(at + body.length);
+          pending = null;
+        } else if (pending.length > pendingLimit) {
+          text = pending;
+          pending = null;
+        } else {
+          return;
+        }
+      }
+      consumeOwn(text);
+    },
+    result() {
+      if (pending !== null) {
+        consumeOwn(pending);
+        pending = null;
+      }
+      if (carry) {
+        consumeOwn("");
+        if (TURN_EVENT_LINE.test(stripAnsi(carry))) {
+          started = true;
+        }
+      }
+      return { started, tail };
+    }
+  };
 }
 
-// Pure decision for the ladder fallback: look only at codex's own stderr (echo cut
-// off), require a startup rejection, and refuse once the turn has started.
-function shouldRetryWithoutOrchestrator(stderrTail, instruction) {
-  const own = codexOwnStderr(stderrTail, instruction);
-  return !turnHadStarted(own) && isOrchestratorRejection(own);
+// Pure decision for the ladder fallback: require a startup rejection in codex's own
+// output and refuse once the turn has started.
+function shouldRetryWithoutOrchestrator(stderr) {
+  return Boolean(stderr) && !stderr.started && isOrchestratorRejection(stderr.tail);
 }
 
 // codex exec flags for a resolved orchestrator ([] when null => codex config default).
@@ -668,24 +705,25 @@ ${prompt}`;
 function spawnCodex(args, cwd, options = {}) {
   return new Promise((resolve, reject) => {
     // teeStderr pipes stderr through this process (the user still sees codex's live
-    // output) while keeping a bounded tail so a failed attempt can be classified.
-    const teeStderr = Boolean(options.teeStderr);
+    // output) while a streaming monitor classifies it so a failed attempt can be
+    // told apart from a startup rejection.
+    const monitor = options.teeStderr ? createStderrMonitor(options.instruction) : null;
     const child = spawn(CODEX.command, [...CODEX.prefix, ...args], {
       cwd,
       env: process.env,
-      stdio: ["ignore", "inherit", teeStderr ? "pipe" : "inherit"],
+      stdio: ["ignore", "inherit", monitor ? "pipe" : "inherit"],
       windowsHide: true
     });
-    let stderrTail = "";
-    if (teeStderr) {
+    if (monitor) {
+      child.stderr.setEncoding("utf8");
       child.stderr.on("data", (chunk) => {
         process.stderr.write(chunk);
-        stderrTail = (stderrTail + chunk.toString("utf8")).slice(-4000);
+        monitor.feed(chunk);
       });
     }
     child.on("error", reject);
     child.on("close", (status, signal) => {
-      resolve({ status: status ?? (signal ? 1 : 0), stderrTail });
+      resolve({ status: status ?? (signal ? 1 : 0), stderr: monitor ? monitor.result() : null });
     });
   });
 }
@@ -702,9 +740,9 @@ async function runImageTurn(orchestrator, tailArgs, cwd, instruction) {
   const first = await spawnCodex(
     [...CODEX_EXEC_BASE_ARGS, ...orchestratorArgs(orchestrator), ...tailArgs],
     cwd,
-    { teeStderr: ladder }
+    { teeStderr: ladder, instruction }
   );
-  if (ladder && first.status !== 0 && shouldRetryWithoutOrchestrator(first.stderrTail, instruction)) {
+  if (ladder && first.status !== 0 && shouldRetryWithoutOrchestrator(first.stderr)) {
     console.error(
       `codex rejected the ladder orchestrator ${orchestrator.model} (effort ${orchestrator.effort}); retrying with the codex config default.`
     );
@@ -884,8 +922,7 @@ export {
   resolveImageOrchestrator,
   orchestratorArgs,
   isOrchestratorRejection,
-  turnHadStarted,
-  codexOwnStderr,
+  createStderrMonitor,
   shouldRetryWithoutOrchestrator,
   runImageTurn,
   CODEX_IMAGE_ORCHESTRATOR_LADDER,
