@@ -332,18 +332,44 @@ function resolveOrchestrator(cwd) {
 const ORCHESTRATOR_REJECTION_PATTERN =
   /(?:\bmodel\b[^\n]{0,240}\b(?:not supported|unsupported|not available|unavailable|does not exist|not found)\b)|(?:\bunknown model\b)|(?:\bmodel_not_found\b)|(?:\b(?:unsupported|invalid|unavailable)\b[^\n]{0,120}\breasoning effort\b)|(?:\breasoning effort\b[^\n]{0,160}\b(?:not supported|unsupported|unavailable|invalid)\b)|(?:\binvalid value\b[^\n]{0,120}\bmodel_reasoning_effort\b)/i;
 
-// `codex exec` writes the echoed user prompt, agent messages, and tool output to
-// stderr as well, so a prompt that merely says "unknown model" would match the
-// pattern above. Only codex's own error lines are classified (flagged by a
-// gpt-6-astra `codex exec review` of this change).
-function codexErrorLines(stderrText) {
-  return String(stderrText ?? "")
-    .split(/\r?\n/)
-    .filter((line) => /^\s*ERROR:/.test(line));
+// codex may style stderr (e.g. under FORCE_COLOR) even when it is piped; classify
+// plain text only.
+function stripAnsi(text) {
+  return String(text ?? "").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
 }
 
+// `codex exec` echoes the full instruction to stderr under a `user` heading before
+// any event, and later prints agent messages and tool output there too. Cut the
+// echo off first so prompt text can never masquerade as a codex event or error line.
+// The captured tail is bounded, so it may start inside the echo; the echo still ends
+// with the instruction's last line, so cut at the first occurrence of that line.
+function codexOwnStderr(stderrTail, instruction) {
+  const text = stripAnsi(stderrTail);
+  const body = String(instruction ?? "");
+  if (!body) {
+    return text;
+  }
+  const whole = text.indexOf(body);
+  if (whole !== -1) {
+    return text.slice(whole + body.length);
+  }
+  const lastLine = body.trimEnd().split("\n").pop();
+  if (lastLine) {
+    const end = text.indexOf(`${lastLine}\n`);
+    if (end !== -1) {
+      return text.slice(end + lastLine.length + 1);
+    }
+  }
+  return text;
+}
+
+// The error record is everything from codex's first `ERROR:` line to the end of
+// the captured text: a pretty-printed JSON rejection (custom providers) spans
+// several lines, and codex exits right after printing it.
 function isOrchestratorRejection(stderrText) {
-  return codexErrorLines(stderrText).some((line) => ORCHESTRATOR_REJECTION_PATTERN.test(line));
+  const text = stripAnsi(stderrText);
+  const start = text.search(/^[ \t]*ERROR:/m);
+  return start !== -1 && ORCHESTRATOR_REJECTION_PATTERN.test(text.slice(start));
 }
 
 // `codex exec` prints an agent message as a bare `codex` line and a tool call as a
@@ -353,11 +379,14 @@ function isOrchestratorRejection(stderrText) {
 const TURN_EVENT_LINE = /^(codex|exec)$/m;
 
 function turnHadStarted(stderrText) {
-  return TURN_EVENT_LINE.test(String(stderrText ?? ""));
+  return TURN_EVENT_LINE.test(stripAnsi(stderrText));
 }
 
-function shouldRetryWithoutOrchestrator(stderrTail) {
-  return !turnHadStarted(stderrTail) && isOrchestratorRejection(stderrTail);
+// Pure decision for the ladder fallback: look only at codex's own stderr (echo cut
+// off), require a startup rejection, and refuse once the turn has started.
+function shouldRetryWithoutOrchestrator(stderrTail, instruction) {
+  const own = codexOwnStderr(stderrTail, instruction);
+  return !turnHadStarted(own) && isOrchestratorRejection(own);
 }
 
 // codex exec flags for a resolved orchestrator ([] when null => codex config default).
@@ -668,14 +697,14 @@ function spawnCodex(args, cwd, options = {}) {
 // the wrapper retries once with no -m/-c, i.e. the codex config default that worked
 // before the ladder existed. An env-forced orchestrator (source "env") never falls
 // back: the user asserted that exact pair, so the error must surface instead.
-async function runImageTurn(orchestrator, tailArgs, cwd) {
+async function runImageTurn(orchestrator, tailArgs, cwd, instruction) {
   const ladder = orchestrator?.source === "ladder";
   const first = await spawnCodex(
     [...CODEX_EXEC_BASE_ARGS, ...orchestratorArgs(orchestrator), ...tailArgs],
     cwd,
     { teeStderr: ladder }
   );
-  if (ladder && first.status !== 0 && shouldRetryWithoutOrchestrator(first.stderrTail)) {
+  if (ladder && first.status !== 0 && shouldRetryWithoutOrchestrator(first.stderrTail, instruction)) {
     console.error(
       `codex rejected the ladder orchestrator ${orchestrator.model} (effort ${orchestrator.effort}); retrying with the codex config default.`
     );
@@ -726,8 +755,9 @@ async function handleGenerate(argv) {
   for (const imagePath of referenceImagePaths) {
     tailArgs.push("--image", imagePath);
   }
-  tailArgs.push("-C", cwd, "--", buildGenerateInstruction(prompt, referenceImagePaths));
-  const result = await runImageTurn(orchestrator, tailArgs, cwd);
+  const instruction = buildGenerateInstruction(prompt, referenceImagePaths);
+  tailArgs.push("-C", cwd, "--", instruction);
+  const result = await runImageTurn(orchestrator, tailArgs, cwd, instruction);
   if (result.status !== 0) {
     process.exitCode = result.status;
   }
@@ -763,8 +793,9 @@ async function handleEdit(argv) {
       `codex image orchestrator: ${orchestrator.model} (effort ${orchestrator.effort}) [${orchestrator.source}]`
     );
   }
-  const tailArgs = ["--image", inputPath, "-C", cwd, "--", buildEditInstruction(inputPath, prompt)];
-  const result = await runImageTurn(orchestrator, tailArgs, cwd);
+  const instruction = buildEditInstruction(inputPath, prompt);
+  const tailArgs = ["--image", inputPath, "-C", cwd, "--", instruction];
+  const result = await runImageTurn(orchestrator, tailArgs, cwd, instruction);
   if (result.status !== 0) {
     process.exitCode = result.status;
   }
@@ -854,6 +885,7 @@ export {
   orchestratorArgs,
   isOrchestratorRejection,
   turnHadStarted,
+  codexOwnStderr,
   shouldRetryWithoutOrchestrator,
   runImageTurn,
   CODEX_IMAGE_ORCHESTRATOR_LADDER,

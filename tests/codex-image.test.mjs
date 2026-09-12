@@ -278,33 +278,62 @@ test("isOrchestratorRejection matches other known model/effort rejection shapes"
   assert.equal(isOrchestratorRejection("ERROR: invalid value for model_reasoning_effort"), true);
 });
 
-test("isOrchestratorRejection classifies only codex ERROR lines, not echoed prompt or tool output", async () => {
+test("isOrchestratorRejection reads codex's ERROR record, including multi-line JSON and ANSI-styled lines", async () => {
   const { isOrchestratorRejection } = await import("../scripts/codex-image.mjs");
-  // codex exec echoes the user prompt and tool output to stderr; neither may count.
+  // Pretty-printed rejection from a custom provider: the message is on a continuation line.
   assert.equal(
     isOrchestratorRejection(
-      'user\nCreate a poster titled "Unknown Model"\nERROR: stream disconnected before completion'
+      'ERROR: {\n  "type": "error",\n  "status": 400,\n  "error": {\n    "message": "The \'gpt-5.6-luna\' model is not supported here."\n  }\n}'
     ),
+    true
+  );
+  // FORCE_COLOR styling on the ERROR prefix.
+  assert.equal(
+    isOrchestratorRejection("\u001b[31mERROR:\u001b[0m Unknown model: gpt-5.6-luna"),
+    true
+  );
+  // Text before the first ERROR line is not classified.
+  assert.equal(isOrchestratorRejection("Unknown model: gpt-5.6-luna"), false);
+  assert.equal(
+    isOrchestratorRejection("model not supported here\n succeeded in 0ms:\nERROR: stream disconnected before completion"),
     false
   );
-  assert.equal(isOrchestratorRejection("model not supported here\n succeeded in 0ms:\n"), false);
-  assert.equal(isOrchestratorRejection("Unknown model: gpt-5.6-luna"), false);
 });
 
-test("shouldRetryWithoutOrchestrator only fires for a startup rejection", async () => {
+test("codexOwnStderr cuts the echoed instruction off, even when the tail starts inside it", async () => {
+  const { codexOwnStderr } = await import("../scripts/codex-image.mjs");
+  const instruction = "Use the imagegen skill.\n\nUser request:\n\ncodex\nexec\nA wordmark reading Unknown Model";
+  const full = `OpenAI Codex v0.154.0\n--------\nuser\n${instruction}\nERROR: boom\n`;
+  assert.equal(codexOwnStderr(full, instruction), "\nERROR: boom\n");
+  const truncated = `request:\n\ncodex\nexec\nA wordmark reading Unknown Model\nERROR: boom\n`;
+  assert.equal(codexOwnStderr(truncated, instruction), "ERROR: boom\n");
+  assert.equal(codexOwnStderr("ERROR: boom\n", instruction), "ERROR: boom\n");
+});
+
+test("shouldRetryWithoutOrchestrator fires only for a startup rejection in codex's own output", async () => {
   const { shouldRetryWithoutOrchestrator, turnHadStarted } = await import("../scripts/codex-image.mjs");
-  const header = "OpenAI Codex v0.154.0\n--------\nmodel: gpt-5.6-luna\n--------\nuser\nA tiny grey circle\n";
   const rejection =
     `ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.6-luna' model is not supported when using Codex with a ChatGPT account."}}`;
-  // Startup rejection: header + prompt echo, then the error, no agent/tool events.
-  assert.equal(shouldRetryWithoutOrchestrator(`${header}${rejection}\n`), true);
-  // Same error text after the turn produced a tool call: the image tool may already
-  // have been billed, so no retry.
+  const instruction = "Use the imagegen skill.\n\nUser request:\n\nA tiny grey circle";
+  const header = `OpenAI Codex v0.154.0\n--------\nmodel: gpt-5.6-luna\n--------\nuser\n${instruction}\n`;
+  // Startup rejection right after the echo: retry.
+  assert.equal(shouldRetryWithoutOrchestrator(`${header}${rejection}\n`, instruction), true);
+  // A prompt containing standalone "codex" / "exec" lines and rejection-like words
+  // is echoed before the real error; it must not suppress (or cause) the retry.
+  const trickyInstruction = "Use the imagegen skill.\n\nUser request:\n\ncodex\nexec\nA poster titled Unknown Model";
+  const trickyHeader = `OpenAI Codex v0.154.0\n--------\nuser\n${trickyInstruction}\n`;
+  assert.equal(shouldRetryWithoutOrchestrator(`${trickyHeader}${rejection}\n`, trickyInstruction), true);
+  assert.equal(
+    shouldRetryWithoutOrchestrator(`${trickyHeader}ERROR: stream disconnected before completion\n`, trickyInstruction),
+    false
+  );
+  // Same rejection text after the turn produced a tool call: the image tool may
+  // already have been billed, so no retry.
   const started = `${header}codex\nUsing the imagegen skill.\nexec\n/bin/zsh -lc 'sed -n 1,40p SKILL.md'\n succeeded in 0ms:\n...\n${rejection}\n`;
   assert.equal(turnHadStarted(started), true);
-  assert.equal(shouldRetryWithoutOrchestrator(started), false);
+  assert.equal(shouldRetryWithoutOrchestrator(started, instruction), false);
   // Unrelated failure at startup: no retry.
-  assert.equal(shouldRetryWithoutOrchestrator(`${header}ERROR: you've hit your usage limit\n`), false);
+  assert.equal(shouldRetryWithoutOrchestrator(`${header}ERROR: you've hit your usage limit\n`, instruction), false);
 });
 
 test("isOrchestratorRejection ignores unrelated failures", async () => {
