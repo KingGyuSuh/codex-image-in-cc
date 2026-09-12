@@ -323,7 +323,8 @@ function resolveOrchestrator(cwd) {
 // Signature of codex rejecting the requested orchestrator model/effort at turn
 // start — e.g. a custom `model_provider` that does not serve an official slug the
 // account catalog still lists, or an account losing access between probe and spawn.
-// Matched only on a non-zero exit. Live shape on 0.144.5 (ChatGPT account):
+// Matched only on a non-zero exit, and only against codex's own `ERROR:` stderr
+// lines. Live shape on 0.144.5 and 0.154.0 (ChatGPT account):
 //   ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error",
 //   "message":"The 'X' model is not supported when using Codex with a ChatGPT account."}}
 // The broader alternates mirror chaptern's battle-tested classifier for the same
@@ -331,8 +332,32 @@ function resolveOrchestrator(cwd) {
 const ORCHESTRATOR_REJECTION_PATTERN =
   /(?:\bmodel\b[^\n]{0,240}\b(?:not supported|unsupported|not available|unavailable|does not exist|not found)\b)|(?:\bunknown model\b)|(?:\bmodel_not_found\b)|(?:\b(?:unsupported|invalid|unavailable)\b[^\n]{0,120}\breasoning effort\b)|(?:\breasoning effort\b[^\n]{0,160}\b(?:not supported|unsupported|unavailable|invalid)\b)|(?:\binvalid value\b[^\n]{0,120}\bmodel_reasoning_effort\b)/i;
 
+// `codex exec` writes the echoed user prompt, agent messages, and tool output to
+// stderr as well, so a prompt that merely says "unknown model" would match the
+// pattern above. Only codex's own error lines are classified (flagged by a
+// gpt-6-astra `codex exec review` of this change).
+function codexErrorLines(stderrText) {
+  return String(stderrText ?? "")
+    .split(/\r?\n/)
+    .filter((line) => /^\s*ERROR:/.test(line));
+}
+
 function isOrchestratorRejection(stderrText) {
-  return ORCHESTRATOR_REJECTION_PATTERN.test(String(stderrText ?? ""));
+  return codexErrorLines(stderrText).some((line) => ORCHESTRATOR_REJECTION_PATTERN.test(line));
+}
+
+// `codex exec` prints an agent message as a bare `codex` line and a tool call as a
+// bare `exec` line on stderr. Either means the turn got past startup — the image
+// tool may already have run and been billed — so a later failure is never retried,
+// whatever its error text says. A model rejection happens before either appears.
+const TURN_EVENT_LINE = /^(codex|exec)$/m;
+
+function turnHadStarted(stderrText) {
+  return TURN_EVENT_LINE.test(String(stderrText ?? ""));
+}
+
+function shouldRetryWithoutOrchestrator(stderrTail) {
+  return !turnHadStarted(stderrTail) && isOrchestratorRejection(stderrTail);
 }
 
 // codex exec flags for a resolved orchestrator ([] when null => codex config default).
@@ -650,7 +675,7 @@ async function runImageTurn(orchestrator, tailArgs, cwd) {
     cwd,
     { teeStderr: ladder }
   );
-  if (ladder && first.status !== 0 && isOrchestratorRejection(first.stderrTail)) {
+  if (ladder && first.status !== 0 && shouldRetryWithoutOrchestrator(first.stderrTail)) {
     console.error(
       `codex rejected the ladder orchestrator ${orchestrator.model} (effort ${orchestrator.effort}); retrying with the codex config default.`
     );
@@ -828,6 +853,8 @@ export {
   resolveImageOrchestrator,
   orchestratorArgs,
   isOrchestratorRejection,
+  turnHadStarted,
+  shouldRetryWithoutOrchestrator,
   runImageTurn,
   CODEX_IMAGE_ORCHESTRATOR_LADDER,
   renderStatusReport,

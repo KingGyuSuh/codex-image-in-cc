@@ -270,12 +270,41 @@ test("isOrchestratorRejection matches the live 0.144.5 rejection shape", async (
 
 test("isOrchestratorRejection matches other known model/effort rejection shapes", async () => {
   const { isOrchestratorRejection } = await import("../scripts/codex-image.mjs");
-  assert.equal(isOrchestratorRejection("model gpt-5.6-luna is not available for this account"), true);
-  assert.equal(isOrchestratorRejection("Unknown model: gpt-5.6-luna"), true);
-  assert.equal(isOrchestratorRejection('{"code":"model_not_found"}'), true);
-  assert.equal(isOrchestratorRejection("The model 'gpt-5.6-luna' does not exist"), true);
-  assert.equal(isOrchestratorRejection("unsupported reasoning effort: high"), true);
-  assert.equal(isOrchestratorRejection("invalid value for model_reasoning_effort"), true);
+  assert.equal(isOrchestratorRejection("ERROR: model gpt-5.6-luna is not available for this account"), true);
+  assert.equal(isOrchestratorRejection("ERROR: Unknown model: gpt-5.6-luna"), true);
+  assert.equal(isOrchestratorRejection('ERROR: {"code":"model_not_found"}'), true);
+  assert.equal(isOrchestratorRejection("ERROR: The model 'gpt-5.6-luna' does not exist"), true);
+  assert.equal(isOrchestratorRejection("ERROR: unsupported reasoning effort: high"), true);
+  assert.equal(isOrchestratorRejection("ERROR: invalid value for model_reasoning_effort"), true);
+});
+
+test("isOrchestratorRejection classifies only codex ERROR lines, not echoed prompt or tool output", async () => {
+  const { isOrchestratorRejection } = await import("../scripts/codex-image.mjs");
+  // codex exec echoes the user prompt and tool output to stderr; neither may count.
+  assert.equal(
+    isOrchestratorRejection(
+      'user\nCreate a poster titled "Unknown Model"\nERROR: stream disconnected before completion'
+    ),
+    false
+  );
+  assert.equal(isOrchestratorRejection("model not supported here\n succeeded in 0ms:\n"), false);
+  assert.equal(isOrchestratorRejection("Unknown model: gpt-5.6-luna"), false);
+});
+
+test("shouldRetryWithoutOrchestrator only fires for a startup rejection", async () => {
+  const { shouldRetryWithoutOrchestrator, turnHadStarted } = await import("../scripts/codex-image.mjs");
+  const header = "OpenAI Codex v0.154.0\n--------\nmodel: gpt-5.6-luna\n--------\nuser\nA tiny grey circle\n";
+  const rejection =
+    `ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.6-luna' model is not supported when using Codex with a ChatGPT account."}}`;
+  // Startup rejection: header + prompt echo, then the error, no agent/tool events.
+  assert.equal(shouldRetryWithoutOrchestrator(`${header}${rejection}\n`), true);
+  // Same error text after the turn produced a tool call: the image tool may already
+  // have been billed, so no retry.
+  const started = `${header}codex\nUsing the imagegen skill.\nexec\n/bin/zsh -lc 'sed -n 1,40p SKILL.md'\n succeeded in 0ms:\n...\n${rejection}\n`;
+  assert.equal(turnHadStarted(started), true);
+  assert.equal(shouldRetryWithoutOrchestrator(started), false);
+  // Unrelated failure at startup: no retry.
+  assert.equal(shouldRetryWithoutOrchestrator(`${header}ERROR: you've hit your usage limit\n`), false);
 });
 
 test("isOrchestratorRejection ignores unrelated failures", async () => {
