@@ -8,6 +8,8 @@ allowed-tools: Bash(node:*)
 
 The first whitespace-separated token in the arguments is the input image path; the rest is the edit prompt. Quote the path if it contains spaces (e.g. `"my photo.png" make it red`).
 
+This command runs a full Codex agent turn and typically takes 1–3 minutes. Run it with a 10-minute Bash timeout (600000 ms) so the turn is not killed mid-edit.
+
 Run:
 
 ```bash

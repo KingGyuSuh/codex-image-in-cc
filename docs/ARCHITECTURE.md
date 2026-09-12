@@ -69,7 +69,7 @@ User      Claude Code      Bash (SKILL.md)     Node script        Codex CLI     
 The actual `codex` invocation:
 
 ```
-codex exec --full-auto --skip-git-repo-check [--image <abs-reference>...] -C <cwd> -- "<minimal instruction>
+codex exec --sandbox workspace-write -c approval_policy="never" --skip-git-repo-check [--image <abs-reference>...] -C <cwd> -- "<minimal instruction>
 
 User request:
 
@@ -79,7 +79,7 @@ User request:
 for `generate`, and:
 
 ```
-codex exec --full-auto --skip-git-repo-check --image <abs-input> -C <cwd> -- "<minimal instruction>
+codex exec --sandbox workspace-write -c approval_policy="never" --skip-git-repo-check --image <abs-input> -C <cwd> -- "<minimal instruction>
 
 User edit request:
 
@@ -109,7 +109,8 @@ For `/codex-image:status`, the Node script does a multi-call diagnostic that is 
 
 - `codex --version` — semver compare against `0.142.0`
 - `codex login status` — parse "Logged in" line
-- `codex exec --full-auto --help` — verify the documented headless mode is still accepted and `--image` attachment support exists
+- `codex exec --sandbox workspace-write --help` — verify the headless sandbox mode the wrapper dispatches with is still accepted
+- `codex exec --help` — verify `--image` attachment support exists (probed separately, so a rejected headless flag cannot mask it)
 - File check on `~/.codex/skills/.system/imagegen/SKILL.md`
 
 ## Load-bearing edge cases
@@ -150,9 +151,17 @@ The flags are repeatable up to 5 references — the built-in image tool caps ref
 
 This keeps reference images mechanical while preserving the "natural language owns output control" rule: sizes, counts, quality, output paths, transparency, and creative direction still live inside the remaining prompt and are interpreted by `imagegen`.
 
-### `--full-auto` is sufficient
+### Sandbox mode, not `--full-auto` — and an explicit approval override
 
-Local validation on Codex CLI 0.142.0 showed the documented `--full-auto` mode runs the `imagegen` flow, copies the selected output from `~/.codex/generated_images/...`, and resizes the final artifact. Do not use the undocumented `--yolo` unless a future Codex regression proves `--full-auto` insufficient.
+The wrapper passes `--sandbox workspace-write -c approval_policy="never"`. Headless `codex exec` resolves that to `approval: never` with `[workdir, /tmp, $TMPDIR]` writable — everything the `imagegen` flow needs to run `mkdir` / `cp` / `sips`, copy the selected output out of `~/.codex/generated_images/...`, and resize the final artifact.
+
+Earlier versions of this plugin passed `--full-auto`, which resolved to the same workspace-write sandbox. Codex CLI 0.144.5 deprecated that spelling (`warning: --full-auto is deprecated; use --sandbox workspace-write instead`) and 0.151.0 removed it from `codex exec` outright (`error: unexpected argument '--full-auto' found`, exit 2), which broke every dispatch and the `status` probe with it ([#5](https://github.com/KingGyuSuh/codex-image-in-cc/issues/5)). `--sandbox workspace-write` is accepted by every release this plugin supports (verified live on 0.144.5 and 0.154.0 here, and on 0.151.0 in #5), so the wrapper uses it unconditionally — there is no per-process flag probe to keep in sync, and `status`, `generate`, and `edit` share one `CODEX_EXEC_BASE_ARGS` constant so the diagnostic can never disagree with what is dispatched.
+
+The explicit `-c approval_policy="never"` is load-bearing, not decoration. `codex exec` defaults headless runs to approval-never via a harness override, but `build_exec_config` (codex-rs `exec/src/lib.rs`) drops that override — rebuilding with `approval_policy: None` — when the resolved config sets `approvals_reviewer = "auto_review"`, unless the legacy `--full-auto` / bypass flag set `preserve_headless_approval_policy`. Bare `--sandbox workspace-write` does not set that flag. Verified on 0.144.5 and again on 0.154.0 with an isolated config (`--ignore-user-config`): bare `--sandbox workspace-write` + `approvals_reviewer = "auto_review"` flips the session header to `approval: on-request` (which would route imagegen's shell steps through the reviewer), and adding `-c approval_policy="never"` restores `approval: never`. For configs without auto_review the override is a no-op — the resolved policy is `never` either way.
+
+`--approve-for-me` (added in Codex CLI 0.153) is not a substitute. It selects the same workspace-write sandbox but resolves to `approval: on-request` behind the automatic reviewer (verified on 0.154.0), so imagegen's shell steps would go through a reviewer model turn instead of simply running inside the sandbox — different semantics and more tokens per turn. Do not use the undocumented `--yolo`, and do not reach for `--dangerously-bypass-approvals-and-sandbox` — image generation only ever needs to write inside the workspace.
+
+The `status` `--image` check runs its own plain `codex exec --help` rather than reusing the headless probe's output. A rejected flag makes clap print a short usage error with no option list, which used to report `--image` as missing whenever the headless probe failed and sent users to an irrelevant "upgrade Codex CLI" next step.
 
 ### Git repository is optional
 
@@ -210,7 +219,7 @@ The current architecture is the synthesis: a thin Node wrapper does only the thi
 
 - **Stay thin.** The Node wrapper does arg splitting and codex spawning. Nothing else. Image-generation intelligence lives in `imagegen`.
 - **No in-bash parsing in SKILL.md.** Single-line `node script <cmd> "$ARGUMENTS"` only. Anything more complex must live in the Node script.
-- **Contract changes propagate here first.** If Codex CLI changes the headless invocation contract (`< /dev/null`, `--full-auto`, `--skip-git-repo-check`, `--image`, the `image_gen.imagegen` extension tool and its `referenced_image_paths` input, `~/.codex/generated_images/` path, `imagegen` skill id, `codex login status`), update `scripts/codex-image.mjs` and the **Load-bearing edge cases** section above in the same PR.
+- **Contract changes propagate here first.** If Codex CLI changes the headless invocation contract (`< /dev/null`, `--sandbox workspace-write -c approval_policy="never"`, `--skip-git-repo-check`, `--image`, the `image_gen.imagegen` extension tool and its `referenced_image_paths` input, `~/.codex/generated_images/` path, `imagegen` skill id, `codex login status`), update `scripts/codex-image.mjs` and the **Load-bearing edge cases** section above in the same PR.
 - **Scope is image generation.** A new Codex built-in tool (`web_search`, `browser`) deserves a separate plugin.
 
 ## Relationship to openai/codex-plugin-cc

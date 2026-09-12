@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  CODEX_EXEC_BASE_ARGS,
   buildEditInstruction,
   buildGenerateInstruction,
   compareSemver,
@@ -117,4 +118,18 @@ test("buildEditInstruction names the edit target's absolute path", () => {
 
 test("resolveCodex uses the bare codex command outside Windows", { skip: process.platform === "win32" }, () => {
   assert.deepEqual(resolveCodex(), { command: "codex", prefix: [] });
+});
+
+test("base exec args use the documented sandbox flag and pin approval-never", () => {
+  // `--full-auto` was removed from `codex exec` in Codex CLI 0.151.0 (#5); the
+  // explicit approval override keeps the approval-never contract under auto_review.
+  assert.deepEqual(CODEX_EXEC_BASE_ARGS, [
+    "exec",
+    "--sandbox",
+    "workspace-write",
+    "-c",
+    'approval_policy="never"',
+    "--skip-git-repo-check"
+  ]);
+  assert.ok(!CODEX_EXEC_BASE_ARGS.includes("--full-auto"));
 });
