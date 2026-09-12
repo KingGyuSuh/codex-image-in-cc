@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-12
+
+### Fixed
+
+- Every `generate` / `edit` dispatch failed on Codex CLI 0.151.0+ with `error: unexpected argument '--full-auto' found` (exit 2), and `/codex-image:status` reported `Ready: no`: that release removed `--full-auto` from `codex exec` (0.144.5 had already deprecated it). The wrapper now spawns `codex exec --sandbox workspace-write -c approval_policy="never"` — the same workspace-write sandbox `--full-auto` implied, accepted by every supported release (0.142 through 0.154). The explicit `approval_policy` override preserves the old approval-never contract for configs with `approvals_reviewer = "auto_review"`, where bare `--sandbox workspace-write` flips headless runs to `approval: on-request` (verified on 0.144.5 and 0.154.0). `--approve-for-me` (0.153+) was not adopted: it resolves to `approval: on-request` behind the automatic reviewer, not `never`. Fixes [#5](https://github.com/KingGyuSuh/codex-image-in-cc/issues/5); supersedes [#6](https://github.com/KingGyuSuh/codex-image-in-cc/pull/6) and [#7](https://github.com/KingGyuSuh/codex-image-in-cc/pull/7) — thanks @mhpsy and @CarolineAntunes for the report, diagnosis, and fixes.
+- `/codex-image:status` no longer reports a spurious `FAIL Image attachment` when the headless probe fails. The `--image` check read the output of the rejected `codex exec --full-auto --help` call — a clap usage error with no option list — so any headless breakage also sent users to an irrelevant "upgrade Codex CLI" next step. It now runs its own `codex exec --help`, and a rejected headless flag is reported on one line instead of the full usage blurb. (Diagnosed independently in [#6](https://github.com/KingGyuSuh/codex-image-in-cc/pull/6) and [#7](https://github.com/KingGyuSuh/codex-image-in-cc/pull/7).)
+- `generate` / `edit` SKILL.md now tell the invoking model to run the command with a 10-minute Bash timeout (600000 ms): an image turn typically takes 1–3 minutes, and the default 2-minute Bash timeout can kill it mid-generation (observed live — the skill reported "in progress" and produced no file).
+
+### Changed
+
+- `status --json`: the `fullAuto` field is renamed to `headlessExec` to match the flag it now verifies; `fullAuto` is kept as a deprecated alias pointing at the same object.
+- `package.json` and `.claude-plugin/marketplace.json` now carry the plugin version (they had been left at 0.1.0 by the 0.2.0 release, and `claude plugin validate` warned about the mismatch).
+
 ## [0.2.0] - 2026-07-10
 
 ### Added

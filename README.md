@@ -6,12 +6,12 @@
 
 Claude Code plugin that exposes Codex CLI's built-in `imagegen` skill as `/codex-image:*` user-invoked plugin skills.
 
-The plugin does not implement image generation itself. Each plugin skill dispatches to `codex exec --full-auto` and lets Codex's `imagegen` skill drive the built-in `image_gen` tool, use attached reference/edit images, save the final artifact, and print a `SAVED: <path>` line for each output.
+The plugin does not implement image generation itself. Each plugin skill dispatches to `codex exec --sandbox workspace-write` and lets Codex's `imagegen` skill drive the built-in `image_gen` tool, use attached reference/edit images, save the final artifact, and print a `SAVED: <path>` line for each output.
 
 ## Requirements
 
 - Claude Code with plugin support.
-- `@openai/codex` CLI v0.142.0 or later (v0.144+ recommended — it moves image generation to the extension-backed tool the instruction prefixes are written for).
+- `@openai/codex` CLI v0.142.0 or later (v0.144+ recommended — it moves image generation to the extension-backed tool the instruction prefixes are written for). Codex CLI 0.151+ removed `--full-auto` from `codex exec`; plugin 0.2.1+ dispatches with `--sandbox workspace-write` instead, which older and current releases both accept.
 - An active `codex login` session.
 - Node.js 18.18 or later.
 

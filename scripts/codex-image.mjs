@@ -13,6 +13,33 @@ const MIN_CODEX_VERSION = "0.142.0";
 // request (schema-enforced via `referenced_image_paths` since codex 0.144).
 const MAX_REFERENCE_IMAGES = 5;
 
+// Base headless exec invocation shared by generate and edit.
+//
+// `--full-auto` was the documented headless spelling through Codex CLI 0.14x. 0.144.5
+// deprecated it ("use --sandbox workspace-write instead") and 0.151.0 removed it from
+// `codex exec` outright (`error: unexpected argument '--full-auto' found`, exit 2),
+// which broke every dispatch (#5). `--sandbox workspace-write` is the same sandbox
+// policy `--full-auto` implied and is accepted by every release this plugin supports
+// (verified 0.144.5 and 0.154.0 here, 0.151.0 in #5), so no per-process flag probe is
+// needed.
+//
+// The explicit `-c approval_policy="never"` is load-bearing: bare `--sandbox
+// workspace-write` drops the headless approval-never default when the user's config
+// sets `approvals_reviewer = "auto_review"` (codex-rs build_exec_config rebuilds with
+// approval_policy: None; verified on 0.144.5 and 0.154.0 — the header flips to
+// `approval: on-request`), which would route imagegen's mkdir/cp/sips through the
+// reviewer. `--full-auto` preserved approval-never implicitly; this keeps that
+// contract. `--approve-for-me` (0.153+) is NOT a substitute: it selects the same
+// sandbox but resolves to `approval: on-request` behind the automatic reviewer.
+const CODEX_EXEC_BASE_ARGS = [
+  "exec",
+  "--sandbox",
+  "workspace-write",
+  "-c",
+  'approval_policy="never"',
+  "--skip-git-repo-check"
+];
+
 // On Windows, `spawn("codex", ...)` misses the npm `codex.cmd` shim (ENOENT) and
 // Node 20+ refuses to spawn `.cmd` directly without a shell (EINVAL, post
 // CVE-2024-27980 hardening). Shelling out would re-expose user prompts to cmd.exe
@@ -124,6 +151,11 @@ function statusLine(ok, label, detail) {
   return `${ok ? "OK" : "FAIL"} ${label}: ${detail}`;
 }
 
+// clap rejects a flag with a multi-line usage blurb; keep a status row to its first line.
+function firstLine(text) {
+  return String(text ?? "").trim().split(/\r?\n/)[0] ?? "";
+}
+
 function findImagegenSkill() {
   const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
   const candidate = path.join(codexHome, "skills", ".system", "imagegen", "SKILL.md");
@@ -145,15 +177,24 @@ function buildStatusReport(options = {}) {
   const loginText = loginStatus ? (loginStatus.stdout || loginStatus.stderr).trim() : "Codex unavailable";
   const loginOk = Boolean(loginStatus?.status === 0 && /logged in/i.test(loginText));
 
-  const fullAutoStatus = codexOk ? runSync(CODEX.command, [...CODEX.prefix, "exec", "--full-auto", "--help"], { cwd }) : null;
-  const fullAutoOk = Boolean(fullAutoStatus?.status === 0);
-  const execHelpText = `${fullAutoStatus?.stdout ?? ""}\n${fullAutoStatus?.stderr ?? ""}`;
-  const imageAttachmentOk = Boolean(fullAutoOk && /(^|\s)(-i,\s*)?--image(\s|=|<|$)/.test(execHelpText));
+  // Headless-mode probe: `--help` exits non-zero on an unknown flag or value without
+  // starting an agent turn, so this verifies the sandbox flag the wrapper dispatches with.
+  const headlessExecStatus = codexOk
+    ? runSync(CODEX.command, [...CODEX.prefix, "exec", "--sandbox", "workspace-write", "--help"], { cwd })
+    : null;
+  const headlessExecOk = Boolean(headlessExecStatus?.status === 0);
+
+  // Probed independently of the headless flag: a rejected flag makes clap print a short
+  // usage error with no option list, which used to report `--image` as missing whenever
+  // the headless probe failed (#5).
+  const execHelp = codexOk ? runSync(CODEX.command, [...CODEX.prefix, "exec", "--help"], { cwd }) : null;
+  const execHelpText = `${execHelp?.stdout ?? ""}\n${execHelp?.stderr ?? ""}`;
+  const imageAttachmentOk = Boolean(execHelp?.status === 0 && /(^|\s)(-i,\s*)?--image(\s|=|<|$)/.test(execHelpText));
 
   const imagegenSkillPath = findImagegenSkill();
   const imagegenOk = Boolean(imagegenSkillPath);
 
-  const ready = nodeOk && codexOk && loginOk && fullAutoOk && imageAttachmentOk && imagegenOk;
+  const ready = nodeOk && codexOk && loginOk && headlessExecOk && imageAttachmentOk && imagegenOk;
   const nextSteps = [];
   if (!nodeOk) {
     nextSteps.push(`Install Node.js ${MIN_NODE_VERSION} or newer.`);
@@ -166,15 +207,22 @@ function buildStatusReport(options = {}) {
   if (codexOk && !loginOk) {
     nextSteps.push("Run `codex login`.");
   }
-  if (codexOk && !fullAutoOk) {
-    nextSteps.push("This plugin depends on `codex exec --full-auto`; verify the installed Codex CLI still supports that documented alias.");
+  if (codexOk && !headlessExecOk) {
+    nextSteps.push("This plugin depends on `codex exec --sandbox workspace-write`; check `codex exec --help` for the current sandbox flag.");
   }
-  if (codexOk && fullAutoOk && !imageAttachmentOk) {
+  if (codexOk && !imageAttachmentOk) {
     nextSteps.push("This plugin depends on `codex exec --image` for edit and reference-image input. Upgrade Codex CLI.");
   }
   if (!imagegenOk) {
     nextSteps.push("The Codex imagegen skill was not found under CODEX_HOME. Reinstall or update Codex CLI.");
   }
+
+  const headlessExec = {
+    ok: headlessExecOk,
+    detail: headlessExecOk
+      ? "`codex exec --sandbox workspace-write` accepted"
+      : firstLine(headlessExecStatus?.stderr || headlessExecStatus?.stdout || "not checked")
+  };
 
   return {
     ready,
@@ -187,12 +235,9 @@ function buildStatusReport(options = {}) {
       minimum: MIN_CODEX_VERSION
     },
     login: { ok: loginOk, detail: loginText || "not logged in" },
-    fullAuto: {
-      ok: fullAutoOk,
-      detail: fullAutoOk
-        ? "`codex exec --full-auto` accepted"
-        : (fullAutoStatus?.stderr || fullAutoStatus?.stdout || "not checked").trim()
-    },
+    headlessExec,
+    // Deprecated alias for `status --json` consumers written against 0.2.0.
+    fullAuto: headlessExec,
     imageAttachment: {
       ok: imageAttachmentOk,
       detail: imageAttachmentOk
@@ -209,7 +254,7 @@ function renderStatusReport(report) {
   lines.push(statusLine(report.node.ok, "Node", `v${report.node.version} (minimum ${report.node.minimum})`));
   lines.push(statusLine(report.codex.ok, "Codex", `${report.codex.version} (minimum ${report.codex.minimum})`));
   lines.push(statusLine(report.login.ok, "Codex login", report.login.detail));
-  lines.push(statusLine(report.fullAuto.ok, "Headless exec", report.fullAuto.detail));
+  lines.push(statusLine(report.headlessExec.ok, "Headless exec", report.headlessExec.detail));
   lines.push(statusLine(report.imageAttachment.ok, "Image attachment", report.imageAttachment.detail));
   lines.push(statusLine(report.imagegenSkill.ok, "imagegen skill", report.imagegenSkill.path ?? "not found"));
   lines.push("");
@@ -388,11 +433,7 @@ async function handleGenerate(argv) {
     process.exitCode = 1;
     return;
   }
-  const codexArgs = [
-    "exec",
-    "--full-auto",
-    "--skip-git-repo-check",
-  ];
+  const codexArgs = [...CODEX_EXEC_BASE_ARGS];
   for (const imagePath of referenceImagePaths) {
     codexArgs.push("--image", imagePath);
   }
@@ -421,9 +462,7 @@ async function handleEdit(argv) {
     return;
   }
   const codexArgs = [
-    "exec",
-    "--full-auto",
-    "--skip-git-repo-check",
+    ...CODEX_EXEC_BASE_ARGS,
     "--image",
     inputPath,
     "-C",
@@ -505,6 +544,7 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
 }
 
 export {
+  CODEX_EXEC_BASE_ARGS,
   buildEditInstruction,
   buildGenerateInstruction,
   buildStatusReport,
